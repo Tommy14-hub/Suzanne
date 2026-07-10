@@ -266,8 +266,17 @@ const GlobeCanvas = memo(function GlobeCanvas() {
 
         /* --- micro-impulsion de zoom (token) : décroissance --- */
         zoomPulse.current *= 0.86;
-        const pulseScale =
-          s === "speaking" ? 1 + zoomPulse.current * 0.035 : 1;
+
+        /* --- échelle finale selon l'état ---
+           thinking : respiration rapide sin() entre 0.95 et 1.05
+           speaking : échelle stable + micro-impulsion par token
+           idle     : échelle de base                                */
+        let pulseScale = 1;
+        if (s === "thinking") {
+          pulseScale = 1 + Math.sin(heartbeat.current * 2.4) * 0.05; // 0.95 → 1.05
+        } else if (s === "speaking") {
+          pulseScale = 1 + zoomPulse.current * 0.04;
+        }
 
         /* --- marqueurs éphémères : fade-out --- */
         const fadeSpan = s === "thinking" ? 2600 : 700; // s'estompent vite quand elle parle
@@ -487,7 +496,7 @@ function ThinkingIndicator() {
 }
 
 /* ============================================================
-   6. COMMAND BAR — capsule vitrée minimale
+   6. COMMAND BAR — input flottant "dans le vide", zéro boîte
    ============================================================ */
 
 function CommandBar() {
@@ -512,12 +521,12 @@ function CommandBar() {
   );
 
   return (
-    <div className="absolute inset-x-0 bottom-6 z-20 flex justify-center px-6">
+    <div className="pointer-events-none absolute inset-x-0 bottom-10 z-20 flex justify-center px-8">
       <motion.div
-        initial={{ opacity: 0, y: 22 }}
+        initial={{ opacity: 0, y: 18 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ ...spring, delay: 0.15 }}
-        className="flex w-full max-w-xl items-center gap-3 rounded-full border border-neutral-200/50 bg-white/70 py-1.5 pl-5 pr-2 shadow-2xl shadow-neutral-200/60 backdrop-blur-md"
+        className="pointer-events-auto flex w-full max-w-xl items-center justify-center gap-3"
       >
         <input
           ref={inputRef}
@@ -527,18 +536,20 @@ function CommandBar() {
           placeholder="Écrire à Suzanne…"
           aria-label="Écrire à Suzanne"
           disabled={!idle}
-          className="min-w-0 flex-1 bg-transparent text-[15px] text-neutral-900 outline-none placeholder:text-neutral-300 disabled:opacity-50"
+          className="min-w-0 flex-1 border-none bg-transparent text-center text-xl text-neutral-900 outline-none placeholder:text-neutral-300 focus:ring-0 disabled:opacity-40"
         />
-        <RiveWaveform />
-        <motion.button
-          whileTap={{ scale: 0.9 }}
+        {/* onde Rive ultra-discrète, collée au texte, sans boîte */}
+        <div className="pointer-events-none shrink-0 opacity-80">
+          <RiveWaveform />
+        </div>
+        <button
           onClick={send}
           disabled={!idle || !value.trim()}
           aria-label="Envoyer"
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-neutral-900 text-sm text-white transition-colors hover:bg-indigo-600 disabled:bg-neutral-200"
+          className="shrink-0 text-lg text-neutral-400 transition-colors hover:text-indigo-500 disabled:opacity-0"
         >
           ↑
-        </motion.button>
+        </button>
       </motion.div>
     </div>
   );
