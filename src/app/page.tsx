@@ -24,7 +24,6 @@ import createGlobe, { type Marker } from "cobe";
 import { motion, AnimatePresence } from "framer-motion";
 import dynamic from "next/dynamic";
 import { GlyphMatrix } from "./GlyphMatrix";
-import SquareLoader from "./SquareLoader";
 import {
   makeLink,
   resolveGlobeIntent,
@@ -631,7 +630,7 @@ const MessageItem = memo(function MessageItem({
         {animate ? (
           <HyperText
             text={msg.text}
-            speed={msg.isUser ? 70 : 60}
+            speed={msg.isUser ? 120 : 110}
             onProgress={msg.isUser ? undefined : pulse}
             onSettle={msg.isUser ? undefined : finishSpeaking}
           />
@@ -653,18 +652,15 @@ function ThinkingIndicator() {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="flex items-center gap-4 self-start"
+          className="self-start"
         >
-          <SquareLoader />
-          {intent && (
-            <motion.span
-              animate={{ opacity: [0.4, 1, 0.4] }}
-              transition={{ duration: 1.6, repeat: Infinity }}
-              className="font-mono text-xs text-neutral-400"
-            >
-              {intent.label}
-            </motion.span>
-          )}
+          <motion.span
+            animate={{ opacity: [0.4, 1, 0.4] }}
+            transition={{ duration: 1.6, repeat: Infinity }}
+            className="font-mono text-xs text-neutral-400"
+          >
+            {intent?.label ?? "…"}
+          </motion.span>
         </motion.div>
       )}
     </AnimatePresence>
