@@ -160,7 +160,9 @@ const GlobeCanvas = memo(function GlobeCanvas() {
   const theta = useRef(0.25);
   const targetTheta = useRef(0.25);
   const zoomPulse = useRef(0); // micro-impulsion par token
-  const heartbeat = useRef(0);
+  const clock = useRef(0); // horloge en secondes (temps réel)
+  const lastFrame = useRef(0);
+  const scaleSmooth = useRef(1); // échelle lissée → anti-saccade
   const status = useRef<SuzanneStatus>("idle");
 
   /* drag + inertie */
@@ -240,6 +242,12 @@ const GlobeCanvas = memo(function GlobeCanvas() {
         const now = performance.now();
         const s = status.current;
 
+        /* horloge basée sur le temps réel (évite les à-coups si le
+           framerate varie) — delta en secondes depuis la frame précédente */
+        const dt = lastFrame.current ? (now - lastFrame.current) / 1000 : 0.016;
+        lastFrame.current = now;
+        clock.current += dt;
+
         /* --- inertie du drag : friction douce --- */
         if (!dragging.current) {
           if (Math.abs(velocity.current) > 0.0002) {
@@ -258,26 +266,25 @@ const GlobeCanvas = memo(function GlobeCanvas() {
         const parallaxTheta = pointerOffset.current.y * 0.12;
         const parallaxPhi = pointerOffset.current.x * 0.1;
 
-        /* --- battement de cœur en thinking --- */
-        heartbeat.current += 0.055;
+        /* --- battement de cœur lumineux en thinking (horloge réelle) --- */
         const beat =
           s === "thinking"
-            ? Math.pow(Math.max(0, Math.sin(heartbeat.current * 2.4)), 6) * 0.5
+            ? Math.pow(Math.max(0, Math.sin(clock.current * 3.2)), 6) * 0.5
             : 0;
 
         /* --- micro-impulsion de zoom (token) : décroissance --- */
-        zoomPulse.current *= 0.86;
+        zoomPulse.current *= 0.9;
 
-        /* --- échelle finale selon l'état ---
-           thinking : respiration rapide sin() entre 0.95 et 1.05
-           speaking : échelle stable + micro-impulsion par token
-           idle     : échelle de base                                */
-        let pulseScale = 1;
+        /* --- échelle CIBLE selon l'état --- */
+        let targetScale = 1;
         if (s === "thinking") {
-          pulseScale = 1 + Math.sin(heartbeat.current * 2.4) * 0.05; // 0.95 → 1.05
+          // respiration douce et régulière (horloge réelle)
+          targetScale = 1 + Math.sin(clock.current * 2.4) * 0.05;
         } else if (s === "speaking") {
-          pulseScale = 1 + zoomPulse.current * 0.04;
+          targetScale = 1 + zoomPulse.current * 0.05;
         }
+        /* lissage de l'échelle → plus aucun à-coup, transition fluide */
+        scaleSmooth.current += (targetScale - scaleSmooth.current) * 0.12;
 
         /* --- marqueurs éphémères : fade-out --- */
         const fadeSpan = s === "thinking" ? 2600 : 700; // s'estompent vite quand elle parle
@@ -294,7 +301,7 @@ const GlobeCanvas = memo(function GlobeCanvas() {
 
         state.phi = phi.current + parallaxPhi;
         state.theta = theta.current + parallaxTheta;
-        state.scale = pulseScale;
+        state.scale = scaleSmooth.current;
         state.mapBrightness = 4.2 + beat * 2.2;
         state.markers = markers;
         state.width = width * 2;
@@ -386,39 +393,42 @@ const spring = {
    mot streamé par Suzanne.
    ============================================================ */
 
-const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#@%&?!";
 
+/**
+ * Chaque caractère commence brouillé puis se fixe de gauche à droite.
+ * `speed` = caractères fixés par seconde. Les lettres non encore fixées
+ * changent en continu pour un effet de "déchiffrage" bien visible.
+ */
 function HyperText({
   text,
   className = "",
-  duration = 380,
+  speed = 26,
 }: {
   text: string;
   className?: string;
-  duration?: number;
+  speed?: number;
 }) {
   const [display, setDisplay] = useState(text);
-  const frame = useRef(0);
   const raf = useRef<number>(0);
 
   useEffect(() => {
     const chars = text.split("");
     const start = performance.now();
-    frame.current = 0;
 
     const tick = (now: number) => {
-      const progress = Math.min(1, (now - start) / duration);
-      // nombre de caractères "fixés" (de gauche à droite)
-      const settled = Math.floor(progress * chars.length);
+      const elapsed = (now - start) / 1000;
+      const settled = elapsed * speed; // nb de caractères fixés
+      let done = true;
       const out = chars.map((c, i) => {
-        if (c === " ") return " ";
-        if (i < settled) return c;
+        if (c === " " || i < settled) return c;
+        done = false;
         return SCRAMBLE_CHARS[
           Math.floor(Math.random() * SCRAMBLE_CHARS.length)
         ];
       });
       setDisplay(out.join(""));
-      if (progress < 1) {
+      if (!done) {
         raf.current = requestAnimationFrame(tick);
       } else {
         setDisplay(text);
@@ -426,7 +436,7 @@ function HyperText({
     };
     raf.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf.current);
-  }, [text, duration]);
+  }, [text, speed]);
 
   return <span className={className}>{display}</span>;
 }
@@ -445,7 +455,8 @@ const MessageItem = memo(function MessageItem({ msg }: { msg: Message }) {
           msg.isUser ? "text-neutral-500" : "text-neutral-900"
         }`}
       >
-        {msg.text}
+        {/* Les réponses de Suzanne se déchiffrent à l'apparition */}
+        {msg.isUser ? msg.text : <HyperText text={msg.text} />}
       </p>
     </motion.div>
   );
@@ -456,11 +467,6 @@ function StreamingText() {
   const speaking = useSuzanneStore((s) => s.status === "speaking");
   if (!speaking || !text) return null;
 
-  // On isole le dernier mot pour lui appliquer l'effet de déchiffrage.
-  const lastSpace = text.lastIndexOf(" ");
-  const head = lastSpace === -1 ? "" : text.slice(0, lastSpace + 1);
-  const lastWord = lastSpace === -1 ? text : text.slice(lastSpace + 1);
-
   return (
     <motion.div
       initial={{ opacity: 0, y: 14 }}
@@ -469,8 +475,7 @@ function StreamingText() {
       className="self-start pr-16"
     >
       <p className="text-lg leading-relaxed text-neutral-900">
-        {head}
-        <HyperText key={text} text={lastWord} />
+        <HyperText text={text} speed={40} />
         <span className="ml-0.5 inline-block h-4 w-[2px] animate-pulse bg-indigo-400 align-middle" />
       </p>
     </motion.div>
