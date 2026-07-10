@@ -1,0 +1,15 @@
+# Next.js
+.next/
+out/
+node_modules/
+.env
+.env.local
+.env*.local
+
+# Vercel
+.vercel
+
+# Misc
+.DS_Store
+*.pem
+npm-debug.log*
