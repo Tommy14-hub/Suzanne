@@ -47,13 +47,12 @@ interface SuzanneStore {
   status: SuzanneStatus;
   messages: Message[];
   currentResponseText: string;
-  /** Compteur incrémenté à chaque token streamé — le globe s'y
-      abonne hors-React pour ses micro-impulsions de zoom. */
   tokenPulse: number;
   setStatus: (s: SuzanneStatus) => void;
   addMessage: (m: Message) => void;
   streamToken: (fullText: string) => void;
-  commitResponse: () => void;
+  commitResponse: (text: string) => void;
+  finishSpeaking: () => void;
 }
 
 export const useSuzanneStore = create<SuzanneStore>((set, get) => ({
@@ -74,17 +73,16 @@ export const useSuzanneStore = create<SuzanneStore>((set, get) => ({
       currentResponseText: fullText,
       tokenPulse: s.tokenPulse + 1,
     })),
-  commitResponse: () => {
-    const { currentResponseText, messages } = get();
-    set({
+  commitResponse: (text: string) =>
+    set((s) => ({
       messages: [
-        ...messages,
-        { id: crypto.randomUUID(), text: currentResponseText, isUser: false },
+        ...s.messages,
+        { id: crypto.randomUUID(), text, isUser: false },
       ],
       currentResponseText: "",
-      status: "idle",
-    });
-  },
+      status: "speaking", // reste en speaking pendant le déchiffrage HyperText
+    })),
+  finishSpeaking: () => set({ status: "idle" }),
 }));
 
 /* ============================================================
@@ -95,41 +93,125 @@ export const useSuzanneStore = create<SuzanneStore>((set, get) => ({
    par chunk, commitResponse à la fin) reste identique.
    ============================================================ */
 
-const FAKE_REPLIES = [
-  "Ton serveur tourne parfaitement. La RX 6750 XT est à 42°C, la VRAM utilisée à 60 %. Que puis-je faire pour toi ?",
-  "Pour le dual-boot Ubuntu, pars sur 250 Go en ext4 avec 16 Go de swap. Je peux détailler le partitionnement si tu veux.",
-  "ROCm permet à Ollama de dialoguer directement avec les 12 Go de VRAM de ta carte graphique, sans passer par le CPU.",
-  "C'est noté. Je viens de l'enregistrer dans ma mémoire vectorielle — je m'en souviendrai la prochaine fois.",
+/* ============================================================
+   MOTEUR DE RÉPONSE TEMPORAIRE — mini "intent matching".
+   Réagit à des mots-clés dans le message. À remplacer par
+   l'appel Ollama réel (garder generateReply → fetch stream).
+   ============================================================ */
+
+interface Intent {
+  keywords: string[];
+  replies: string[];
+}
+
+const INTENTS: Intent[] = [
+  {
+    keywords: ["bonjour", "salut", "hello", "coucou", "hey", "bonsoir"],
+    replies: [
+      "Bonjour Thomas. Ravie de te retrouver. Sur quoi travaille-t-on aujourd'hui ?",
+      "Salut ! Le serveur est chaud, la VRAM au repos. Je t'écoute.",
+    ],
+  },
+  {
+    keywords: ["gpu", "carte", "vram", "6750", "radeon", "température", "temp"],
+    replies: [
+      "La RX 6750 XT tourne à 42°C, VRAM utilisée à 60 %. Tout est nominal pour un modèle 14B.",
+      "Ta carte a 12 Go de VRAM — largement de quoi charger Qwen 2.5 14B quantifié en Q4.",
+    ],
+  },
+  {
+    keywords: ["ubuntu", "dual", "boot", "partition", "installer", "linux"],
+    replies: [
+      "Pour le dual-boot : 250 Go en ext4, 16 Go de swap, et garde ton EFI Windows intact. Je te détaille si tu veux.",
+      "Ubuntu 24.04 LTS est le bon choix ici — support ROCm officiel et noyau récent pour ta carte.",
+    ],
+  },
+  {
+    keywords: ["rocm", "pilote", "driver", "amd"],
+    replies: [
+      "ROCm laisse Ollama parler directement à ta carte, sans passer par le CPU. C'est la clé de la vitesse.",
+      "Vérifie bien la compatibilité ROCm de ton noyau — la RX 6750 XT (gfx1031) demande parfois HSA_OVERRIDE_GFX_VERSION=10.3.0.",
+    ],
+  },
+  {
+    keywords: ["ollama", "modèle", "model", "llm", "qwen", "deepseek", "llama"],
+    replies: [
+      "Ollama encapsule llama.cpp et gère le chargement en VRAM. Un simple `ollama run qwen2.5:14b` et je prends vie.",
+      "Pour ton matériel, je conseille Qwen 2.5 14B en Q4_K_M : bon équilibre qualité/mémoire.",
+    ],
+  },
+  {
+    keywords: ["docker", "conteneur", "container", "compose"],
+    replies: [
+      "Docker isolera proprement Open WebUI, la TTS et le monitoring. Un docker-compose.yml et tout se lance ensemble.",
+      "Bon réflexe DevOps : chaque service dans son conteneur, orchestré par Compose. On versionnera ça sur ton Git.",
+    ],
+  },
+  {
+    keywords: ["merci", "super", "génial", "parfait", "top", "cool"],
+    replies: [
+      "Avec plaisir. On avance bien sur le projet.",
+      "C'est un vrai plaisir de construire ça avec toi.",
+    ],
+  },
+  {
+    keywords: ["voix", "parle", "tts", "kokoro", "piper", "audio", "son"],
+    replies: [
+      "Ma voix passera par Kokoro ou Piper, sur CPU, pour ne pas voler de VRAM au modèle. Français fluide garanti.",
+      "La synthèse vocale tournera en tâche de fond — tu me parleras, je te répondrai à voix haute.",
+    ],
+  },
 ];
 
+const FALLBACKS = [
+  "Intéressant. Développe un peu — je veux être sûre de bien saisir ton besoin.",
+  "Je note ça. Tu veux qu'on creuse cet aspect du projet ensemble ?",
+  "Bien reçu. Dis-m'en plus, et je t'oriente vers la meilleure approche.",
+  "D'accord. On peut aborder ça côté architecture ou côté mise en œuvre — tu préfères quoi ?",
+];
+
+function pick(arr: string[]): string {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+/** Moteur temporaire. 🔌 OLLAMA : remplacer par un fetch streaming
+    vers http://localhost:11434/api/chat qui renvoie la réponse. */
+function generateReply(userText: string): string {
+  const lower = userText.toLowerCase();
+  const matched = INTENTS.filter((intent) =>
+    intent.keywords.some((k) => lower.includes(k))
+  );
+  if (matched.length > 0) {
+    // si plusieurs intents matchent, on en combine deux pour + de répondant
+    if (matched.length > 1 && Math.random() > 0.5) {
+      return `${pick(matched[0].replies)} ${pick(matched[1].replies)}`;
+    }
+    return pick(matched[0].replies);
+  }
+  return pick(FALLBACKS);
+}
+
 function useStreamText() {
-  const replyIdx = useRef(0);
   const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
   useEffect(() => () => timers.current.forEach(clearTimeout), []);
 
   const stream = useCallback((userText: string) => {
-    const { setStatus, addMessage, streamToken, commitResponse } =
+    const { setStatus, addMessage, commitResponse } =
       useSuzanneStore.getState();
 
     addMessage({ id: crypto.randomUUID(), text: userText, isUser: true });
     setStatus("thinking");
 
-    const reply = FAKE_REPLIES[replyIdx.current++ % FAKE_REPLIES.length];
+    const reply = generateReply(userText);
+    // temps de "réflexion" proportionnel à la longueur (plus vivant)
+    const thinkMs = 900 + Math.min(1600, reply.length * 12);
 
     timers.current.push(
       setTimeout(() => {
-        setStatus("speaking");
-        const words = reply.split(" ");
-        let i = 0;
-        const iv = setInterval(() => {
-          i++;
-          streamToken(words.slice(0, i).join(" "));
-          if (i >= words.length) {
-            clearInterval(iv);
-            timers.current.push(setTimeout(commitResponse, 450));
-          }
-        }, 85);
-      }, 2200)
+        // La réponse complète est posée d'un coup ; HyperText l'anime
+        // une seule fois (plus de dédoublement streaming + commit).
+        commitResponse(reply);
+      }, thinkMs)
     );
   }, []);
 
@@ -163,6 +245,7 @@ const GlobeCanvas = memo(function GlobeCanvas() {
   const clock = useRef(0); // horloge en secondes (temps réel)
   const lastFrame = useRef(0);
   const scaleSmooth = useRef(1); // échelle lissée → anti-saccade
+  const beatSmooth = useRef(0); // luminosité lissée → anti-saccade
   const status = useRef<SuzanneStatus>("idle");
 
   /* drag + inertie */
@@ -267,24 +350,26 @@ const GlobeCanvas = memo(function GlobeCanvas() {
         const parallaxPhi = pointerOffset.current.x * 0.1;
 
         /* --- battement de cœur lumineux en thinking (horloge réelle) --- */
-        const beat =
+        const targetBeat =
           s === "thinking"
-            ? Math.pow(Math.max(0, Math.sin(clock.current * 3.2)), 6) * 0.5
+            ? Math.pow(Math.max(0, Math.sin(clock.current * 3.2)), 4) * 0.5
             : 0;
+        /* lissage du beat → pas de coupure brutale en sortie de thinking */
+        beatSmooth.current += (targetBeat - beatSmooth.current) * 0.15;
 
         /* --- micro-impulsion de zoom (token) : décroissance --- */
-        zoomPulse.current *= 0.9;
+        zoomPulse.current *= 0.92;
 
         /* --- échelle CIBLE selon l'état --- */
         let targetScale = 1;
         if (s === "thinking") {
-          // respiration douce et régulière (horloge réelle)
           targetScale = 1 + Math.sin(clock.current * 2.4) * 0.05;
         } else if (s === "speaking") {
           targetScale = 1 + zoomPulse.current * 0.05;
         }
-        /* lissage de l'échelle → plus aucun à-coup, transition fluide */
-        scaleSmooth.current += (targetScale - scaleSmooth.current) * 0.12;
+        /* lissage doux de l'échelle → transitions fluides, y compris
+           le retour à 1 quand l'animation se termine */
+        scaleSmooth.current += (targetScale - scaleSmooth.current) * 0.08;
 
         /* --- marqueurs éphémères : fade-out --- */
         const fadeSpan = s === "thinking" ? 2600 : 700; // s'estompent vite quand elle parle
@@ -302,7 +387,7 @@ const GlobeCanvas = memo(function GlobeCanvas() {
         state.phi = phi.current + parallaxPhi;
         state.theta = theta.current + parallaxTheta;
         state.scale = scaleSmooth.current;
-        state.mapBrightness = 4.2 + beat * 2.2;
+        state.mapBrightness = 4.2 + beatSmooth.current * 2.2;
         state.markers = markers;
         state.width = width * 2;
         state.height = width * 2;
@@ -396,32 +481,47 @@ const spring = {
 const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#@%&?!";
 
 /**
- * Chaque caractère commence brouillé puis se fixe de gauche à droite.
- * `speed` = caractères fixés par seconde. Les lettres non encore fixées
- * changent en continu pour un effet de "déchiffrage" bien visible.
+ * Déchiffrage : chaque caractère commence brouillé puis se fixe de
+ * gauche à droite. `speed` = caractères/seconde.
+ * - onSettle() est appelé quand tout est fixé.
+ * - onProgress() est appelé à chaque nouveau caractère fixé
+ *   (sert à faire pulser le globe en rythme).
  */
 function HyperText({
   text,
   className = "",
-  speed = 26,
+  speed = 34,
+  onSettle,
+  onProgress,
 }: {
   text: string;
   className?: string;
   speed?: number;
+  onSettle?: () => void;
+  onProgress?: () => void;
 }) {
-  const [display, setDisplay] = useState(text);
+  const [display, setDisplay] = useState("");
   const raf = useRef<number>(0);
+  const lastSettled = useRef(0);
 
   useEffect(() => {
     const chars = text.split("");
     const start = performance.now();
+    lastSettled.current = 0;
 
     const tick = (now: number) => {
       const elapsed = (now - start) / 1000;
-      const settled = elapsed * speed; // nb de caractères fixés
+      const settledCount = Math.floor(elapsed * speed);
+
+      // pulse le globe à chaque nouveau caractère fixé
+      if (settledCount > lastSettled.current) {
+        lastSettled.current = settledCount;
+        onProgress?.();
+      }
+
       let done = true;
       const out = chars.map((c, i) => {
-        if (c === " " || i < settled) return c;
+        if (c === " " || i < elapsed * speed) return c;
         done = false;
         return SCRAMBLE_CHARS[
           Math.floor(Math.random() * SCRAMBLE_CHARS.length)
@@ -432,16 +532,32 @@ function HyperText({
         raf.current = requestAnimationFrame(tick);
       } else {
         setDisplay(text);
+        onSettle?.();
       }
     };
     raf.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf.current);
+    // onSettle/onProgress volontairement hors deps (refs stables)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, speed]);
 
   return <span className={className}>{display}</span>;
 }
 
-const MessageItem = memo(function MessageItem({ msg }: { msg: Message }) {
+const MessageItem = memo(function MessageItem({
+  msg,
+  animate = false,
+}: {
+  msg: Message;
+  animate?: boolean;
+}) {
+  const finishSpeaking = useSuzanneStore((s) => s.finishSpeaking);
+
+  // pulse le globe pendant le déchiffrage (via tokenPulse hors-React)
+  const pulse = useCallback(() => {
+    useSuzanneStore.setState((s) => ({ tokenPulse: s.tokenPulse + 1 }));
+  }, []);
+
   return (
     <motion.div
       layout
@@ -455,32 +571,20 @@ const MessageItem = memo(function MessageItem({ msg }: { msg: Message }) {
           msg.isUser ? "text-neutral-500" : "text-neutral-900"
         }`}
       >
-        {/* Les réponses de Suzanne se déchiffrent à l'apparition */}
-        {msg.isUser ? msg.text : <HyperText text={msg.text} />}
+        {animate ? (
+          <HyperText
+            text={msg.text}
+            speed={msg.isUser ? 55 : 34}
+            onProgress={msg.isUser ? undefined : pulse}
+            onSettle={msg.isUser ? undefined : finishSpeaking}
+          />
+        ) : (
+          msg.text
+        )}
       </p>
     </motion.div>
   );
 });
-
-function StreamingText() {
-  const text = useSuzanneStore((s) => s.currentResponseText);
-  const speaking = useSuzanneStore((s) => s.status === "speaking");
-  if (!speaking || !text) return null;
-
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 14 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={spring}
-      className="self-start pr-16"
-    >
-      <p className="text-lg leading-relaxed text-neutral-900">
-        <HyperText text={text} speed={40} />
-        <span className="ml-0.5 inline-block h-4 w-[2px] animate-pulse bg-indigo-400 align-middle" />
-      </p>
-    </motion.div>
-  );
-}
 
 function ThinkingIndicator() {
   const thinking = useSuzanneStore((s) => s.status === "thinking");
@@ -637,10 +741,13 @@ export default function SuzannePage() {
         className="relative z-10 h-[calc(100vh-84px)] overflow-y-auto px-8 pb-48 pt-2 md:px-16"
       >
         <div className="flex max-w-xl flex-col gap-16">
-          {messages.map((m) => (
-            <MessageItem key={m.id} msg={m} />
+          {messages.map((m, i) => (
+            <MessageItem
+              key={m.id}
+              msg={m}
+              animate={i === messages.length - 1 && m.id !== "welcome"}
+            />
           ))}
-          <StreamingText />
           <ThinkingIndicator />
         </div>
       </main>
