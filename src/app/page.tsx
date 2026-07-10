@@ -22,7 +22,13 @@ import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import createGlobe, { type Marker } from "cobe";
 import { motion, AnimatePresence } from "framer-motion";
-import { useRive, useStateMachineInput } from "@rive-app/react-canvas";
+import dynamic from "next/dynamic";
+
+/* Rive chargé uniquement côté client (évite tout crash SSR au build Vercel) */
+const RiveWaveform = dynamic(() => import("./RiveWaveform"), {
+  ssr: false,
+  loading: () => <div className="h-10 w-32 shrink-0" aria-hidden="true" />,
+});
 
 /* ============================================================
    1. STORE ZUSTAND
@@ -353,32 +359,6 @@ const GlobeCanvas = memo(function GlobeCanvas() {
 });
 
 /* ============================================================
-   4. RIVE WAVEFORM — onde sonore réelle dans la capsule
-   ============================================================ */
-
-const STATE_MACHINE = "StateMachine 1";
-
-function RiveWaveform() {
-  const speaking = useSuzanneStore((s) => s.status === "speaking");
-  const { rive, RiveComponent } = useRive({
-    src: "/waveform.riv",
-    stateMachines: STATE_MACHINE,
-    autoplay: true,
-  });
-  const isActive = useStateMachineInput(rive, STATE_MACHINE, "isActive", false);
-
-  useEffect(() => {
-    if (isActive) isActive.value = speaking;
-  }, [speaking, isActive]);
-
-  return (
-    <div className="h-10 w-32 shrink-0" aria-hidden="true">
-      <RiveComponent style={{ width: "100%", height: "100%" }} />
-    </div>
-  );
-}
-
-/* ============================================================
    5. CHAT — typographie pure, zéro étiquette
    ============================================================ */
 
@@ -388,6 +368,58 @@ const spring = {
   damping: 26,
   mass: 0.8,
 };
+
+/* ============================================================
+   HYPERTEXT — effet de brouillage/déchiffrage des caractères
+   (façon Magic UI). Chaque lettre scramble aléatoirement puis
+   se fixe, de gauche à droite. Utilisé pour révéler le dernier
+   mot streamé par Suzanne.
+   ============================================================ */
+
+const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+function HyperText({
+  text,
+  className = "",
+  duration = 380,
+}: {
+  text: string;
+  className?: string;
+  duration?: number;
+}) {
+  const [display, setDisplay] = useState(text);
+  const frame = useRef(0);
+  const raf = useRef<number>(0);
+
+  useEffect(() => {
+    const chars = text.split("");
+    const start = performance.now();
+    frame.current = 0;
+
+    const tick = (now: number) => {
+      const progress = Math.min(1, (now - start) / duration);
+      // nombre de caractères "fixés" (de gauche à droite)
+      const settled = Math.floor(progress * chars.length);
+      const out = chars.map((c, i) => {
+        if (c === " ") return " ";
+        if (i < settled) return c;
+        return SCRAMBLE_CHARS[
+          Math.floor(Math.random() * SCRAMBLE_CHARS.length)
+        ];
+      });
+      setDisplay(out.join(""));
+      if (progress < 1) {
+        raf.current = requestAnimationFrame(tick);
+      } else {
+        setDisplay(text);
+      }
+    };
+    raf.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf.current);
+  }, [text, duration]);
+
+  return <span className={className}>{display}</span>;
+}
 
 const MessageItem = memo(function MessageItem({ msg }: { msg: Message }) {
   return (
@@ -413,6 +445,12 @@ function StreamingText() {
   const text = useSuzanneStore((s) => s.currentResponseText);
   const speaking = useSuzanneStore((s) => s.status === "speaking");
   if (!speaking || !text) return null;
+
+  // On isole le dernier mot pour lui appliquer l'effet de déchiffrage.
+  const lastSpace = text.lastIndexOf(" ");
+  const head = lastSpace === -1 ? "" : text.slice(0, lastSpace + 1);
+  const lastWord = lastSpace === -1 ? text : text.slice(lastSpace + 1);
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 14 }}
@@ -421,7 +459,8 @@ function StreamingText() {
       className="self-start pr-16"
     >
       <p className="text-lg leading-relaxed text-neutral-900">
-        {text}
+        {head}
+        <HyperText key={text} text={lastWord} />
         <span className="ml-0.5 inline-block h-4 w-[2px] animate-pulse bg-indigo-400 align-middle" />
       </p>
     </motion.div>
