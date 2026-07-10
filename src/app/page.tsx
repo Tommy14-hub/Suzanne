@@ -23,6 +23,7 @@ import { useShallow } from "zustand/react/shallow";
 import createGlobe, { type Marker } from "cobe";
 import { motion, AnimatePresence } from "framer-motion";
 import dynamic from "next/dynamic";
+import { GlyphMatrix } from "./GlyphMatrix";
 
 /* Rive chargé uniquement côté client (évite tout crash SSR au build Vercel) */
 const RiveWaveform = dynamic(() => import("./RiveWaveform"), {
@@ -605,6 +606,18 @@ export default function SuzannePage() {
 
   return (
     <div className="relative h-screen w-full overflow-hidden bg-[#FAFAFA] font-sans antialiased">
+      {/* Fond animé de glyphes — très discret, derrière tout le reste */}
+      <div className="pointer-events-none absolute inset-0 z-0 opacity-[0.35]">
+        <GlyphMatrix
+          glyphs="01·•+*/\<>="
+          cellSize={14}
+          mutationRate={0.04}
+          interval={90}
+          fadeBottom={0.6}
+          color="#000000"
+        />
+      </div>
+
       <GlobeCanvas />
 
       <header className="relative z-10 flex items-center justify-between px-8 py-6 md:px-16">
