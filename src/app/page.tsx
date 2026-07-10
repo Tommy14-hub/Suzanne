@@ -18,18 +18,12 @@ import {
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
-import createGlobe, { type Marker } from "cobe";
 import { motion, AnimatePresence } from "framer-motion";
 import dynamic from "next/dynamic";
 import { GlyphMatrix } from "./GlyphMatrix";
-import {
-  makeLink,
-  resolveGlobeIntent,
-  type NetLink,
-  type GlobeIntent,
-} from "./networkSim";
+import { resolveGlobeIntent, type GlobeIntent } from "./networkSim";
+import { useSuzanneStore, type Message } from "./store";
 
 /* Rive chargé uniquement côté client (évite tout crash SSR au build Vercel) */
 const RiveWaveform = dynamic(() => import("./RiveWaveform"), {
@@ -37,63 +31,6 @@ const RiveWaveform = dynamic(() => import("./RiveWaveform"), {
   loading: () => <div className="h-10 w-32 shrink-0" aria-hidden="true" />,
 });
 
-/* ============================================================
-   1. STORE ZUSTAND
-   ============================================================ */
-
-type SuzanneStatus = "idle" | "thinking" | "speaking";
-
-interface Message {
-  id: string;
-  text: string;
-  isUser: boolean;
-}
-
-interface SuzanneStore {
-  status: SuzanneStatus;
-  messages: Message[];
-  currentResponseText: string;
-  tokenPulse: number;
-  globeIntent: GlobeIntent | null;
-  setStatus: (s: SuzanneStatus) => void;
-  addMessage: (m: Message) => void;
-  streamToken: (fullText: string) => void;
-  commitResponse: (text: string) => void;
-  finishSpeaking: () => void;
-  setGlobeIntent: (i: GlobeIntent | null) => void;
-}
-
-export const useSuzanneStore = create<SuzanneStore>((set, get) => ({
-  status: "idle",
-  messages: [
-    {
-      id: "welcome",
-      text: "Bonjour. Je suis Suzanne. Fais glisser le globe, survole-le, et écris-moi pour voir mes états en action.",
-      isUser: false,
-    },
-  ],
-  currentResponseText: "",
-  tokenPulse: 0,
-  globeIntent: null,
-  setStatus: (status) => set({ status }),
-  addMessage: (m) => set((s) => ({ messages: [...s.messages, m] })),
-  setGlobeIntent: (globeIntent) => set({ globeIntent }),
-  streamToken: (fullText) =>
-    set((s) => ({
-      currentResponseText: fullText,
-      tokenPulse: s.tokenPulse + 1,
-    })),
-  commitResponse: (text: string) =>
-    set((s) => ({
-      messages: [
-        ...s.messages,
-        { id: crypto.randomUUID(), text, isUser: false },
-      ],
-      currentResponseText: "",
-      status: "speaking", // reste en speaking pendant le déchiffrage HyperText
-    })),
-  finishSpeaking: () => set({ status: "idle" }),
-}));
 
 /* ============================================================
    2. STREAMING SIMULÉ
@@ -232,263 +169,22 @@ function useStreamText() {
    3. GLOBE COBE — hyper-interactif, zéro re-render React
    ============================================================ */
 
-const FRANCE: Marker = { location: [46.6, 2.35], size: 0.08 };
 
-function randomMarker(): Marker & { born: number } {
-  return {
-    location: [(Math.random() - 0.5) * 140, (Math.random() - 0.5) * 340],
-    size: 0.03 + Math.random() * 0.04,
-    born: performance.now(),
-  };
-}
+/* ============================================================
+   4. GLOBE — react-globe.gl (arcs, satellite, anneaux)
+   Chargé client-only (three.js n'aime pas le SSR).
+   ============================================================ */
 
-const GlobeCanvas = memo(function GlobeCanvas() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+const GlobeScene = dynamic(() => import("./GlobeScene"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex h-full w-full items-center justify-center">
+      <div className="h-40 w-40 rounded-full bg-indigo-100/50 blur-3xl" />
+    </div>
+  ),
+});
 
-  /* --- refs mutables lues par onRender (jamais de re-render) --- */
-  const phi = useRef(0);
-  const speed = useRef(0.003);
-  const targetSpeed = useRef(0.003);
-  const theta = useRef(0.25);
-  const targetTheta = useRef(0.25);
-  const zoomPulse = useRef(0); // micro-impulsion par token
-  const clock = useRef(0); // horloge en secondes (temps réel)
-  const lastFrame = useRef(0);
-  const scaleSmooth = useRef(1); // échelle lissée → anti-saccade
-  const beatSmooth = useRef(0); // luminosité lissée → anti-saccade
-  const status = useRef<SuzanneStatus>("idle");
-
-  /* drag + inertie */
-  const dragging = useRef(false);
-  const lastX = useRef(0);
-  const velocity = useRef(0);
-
-  /* parallaxe magnétique */
-  const pointerOffset = useRef({ x: 0, y: 0 });
-
-  /* marqueurs éphémères */
-  const ephemeral = useRef<(Marker & { born: number })[]>([]);
-  const markerTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  /* overlay réseau (villes actives comme markers cobe) */
-  const links = useRef<NetLink[]>([]);
-  const linkTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-  const intent = useRef<GlobeIntent | null>(null);
-
-  useEffect(() => {
-    /* Abonnements hors cycle React */
-    const unsub = useSuzanneStore.subscribe((state, prev) => {
-      status.current = state.status;
-      intent.current = state.globeIntent;
-
-      /* micro-impulsion de zoom à chaque token streamé */
-      if (state.tokenPulse !== prev.tokenPulse) zoomPulse.current = 1;
-
-      /* cinématique des états */
-      if (state.status === "thinking") {
-        targetSpeed.current = 0.016;
-        targetTheta.current = 0.85; // bascule vers le pôle nord
-
-        /* génère un trafic réseau intense selon le mode d'intent */
-        if (!linkTimer.current) {
-          const mode = state.globeIntent?.mode ?? "network";
-          const target = state.globeIntent?.target;
-          const spawn = () => {
-            if (mode === "ping" || mode === "satellite") {
-              // toutes les connexions convergent vers le pays cible
-              if (links.current.length < 8 && target) {
-                links.current.push(makeLink(undefined, target));
-              }
-            } else {
-              // trafic mondial dense
-              if (links.current.length < 12) links.current.push(makeLink());
-            }
-          };
-          spawn();
-          linkTimer.current = setInterval(spawn, mode === "network" ? 180 : 280);
-        }
-
-        if (!markerTimer.current) {
-          markerTimer.current = setInterval(() => {
-            if (ephemeral.current.length < 14)
-              ephemeral.current.push(randomMarker());
-          }, 220);
-        }
-      } else {
-        if (markerTimer.current) {
-          clearInterval(markerTimer.current);
-          markerTimer.current = null;
-        }
-        if (linkTimer.current) {
-          clearInterval(linkTimer.current);
-          linkTimer.current = null;
-        }
-        if (state.status === "speaking") {
-          targetSpeed.current = 0.006;
-          targetTheta.current = 0.3;
-        } else {
-          targetSpeed.current = 0.003;
-          targetTheta.current = 0.25;
-        }
-      }
-    });
-    return () => {
-      unsub();
-      if (markerTimer.current) clearInterval(markerTimer.current);
-      if (linkTimer.current) clearInterval(linkTimer.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    let width = canvas.offsetWidth;
-    const onResize = () => (width = canvas.offsetWidth);
-    window.addEventListener("resize", onResize);
-
-    const globe = createGlobe(canvas, {
-      devicePixelRatio: 2,
-      width: width * 2,
-      height: width * 2,
-      phi: 0,
-      theta: 0.25,
-      dark: 0,
-      diffuse: 1.2,
-      mapSamples: 26000,
-      mapBrightness: 4.2,
-      baseColor: [0.93, 0.93, 0.96],
-      markerColor: [99 / 255, 102 / 255, 241 / 255],
-      glowColor: [0.86, 0.87, 0.99],
-      scale: 1,
-      markers: [FRANCE],
-      onRender: (state) => {
-        const now = performance.now();
-        const s = status.current;
-
-        /* horloge basée sur le temps réel (évite les à-coups si le
-           framerate varie) — delta en secondes depuis la frame précédente */
-        const dt = lastFrame.current ? (now - lastFrame.current) / 1000 : 0.016;
-        lastFrame.current = now;
-        clock.current += dt;
-
-        /* --- inertie du drag : friction douce --- */
-        if (!dragging.current) {
-          if (Math.abs(velocity.current) > 0.0002) {
-            phi.current += velocity.current;
-            velocity.current *= 0.94; // friction
-          } else {
-            velocity.current = 0;
-            /* lissage vitesse auto + rotation */
-            speed.current += (targetSpeed.current - speed.current) * 0.045;
-            phi.current += speed.current;
-          }
-        }
-
-        /* --- inclinaison d'axe (état) + parallaxe magnétique --- */
-        theta.current += (targetTheta.current - theta.current) * 0.03;
-        const parallaxTheta = pointerOffset.current.y * 0.12;
-        const parallaxPhi = pointerOffset.current.x * 0.1;
-
-        /* --- battement de cœur lumineux en thinking (horloge réelle) --- */
-        const targetBeat =
-          s === "thinking"
-            ? Math.pow(Math.max(0, Math.sin(clock.current * 3.2)), 4) * 0.5
-            : 0;
-        /* lissage du beat → pas de coupure brutale en sortie de thinking */
-        beatSmooth.current += (targetBeat - beatSmooth.current) * 0.15;
-
-        /* --- micro-impulsion de zoom (token) : décroissance --- */
-        zoomPulse.current *= 0.92;
-
-        /* --- échelle CIBLE selon l'état --- */
-        let targetScale = 1;
-        if (s === "thinking") {
-          targetScale = 1 + Math.sin(clock.current * 2.4) * 0.05;
-        } else if (s === "speaking") {
-          targetScale = 1 + zoomPulse.current * 0.05;
-        }
-        /* lissage doux de l'échelle → transitions fluides, y compris
-           le retour à 1 quand l'animation se termine */
-        scaleSmooth.current += (targetScale - scaleSmooth.current) * 0.08;
-
-        /* --- marqueurs éphémères : fade-out --- */
-        const fadeSpan = s === "thinking" ? 2600 : 700; // s'estompent vite quand elle parle
-        ephemeral.current = ephemeral.current.filter(
-          (m) => now - m.born < fadeSpan
-        );
-
-        /* --- villes réseau : markers cobe natifs (bien projetés),
-               taille pulsée pour simuler l'activité réseau --- */
-        links.current = links.current.filter((l) => now - l.born < l.ttl);
-        const netMarkers: Marker[] = links.current.flatMap((l) => {
-          const age = (now - l.born) / l.ttl;
-          const env = Math.sin(age * Math.PI); // cloche 0→1→0
-          const pulse = 0.03 + env * 0.05 + Math.sin(now / 120) * 0.01;
-          return [
-            { location: [l.from.lat, l.from.lng], size: Math.max(0.01, pulse) },
-            { location: [l.to.lat, l.to.lng], size: Math.max(0.01, pulse * 0.8) },
-          ];
-        });
-
-        const markers: Marker[] = [
-          FRANCE,
-          ...netMarkers,
-          ...ephemeral.current.map((m) => ({
-            location: m.location,
-            size: m.size * Math.max(0, 1 - (now - m.born) / fadeSpan),
-          })),
-        ];
-
-        state.phi = phi.current + parallaxPhi;
-        state.theta = theta.current + parallaxTheta;
-        state.scale = scaleSmooth.current;
-        state.mapBrightness = 4.2 + beatSmooth.current * 2.2;
-        state.markers = markers;
-        state.width = width * 2;
-        state.height = width * 2;
-      },
-    });
-
-    return () => {
-      globe.destroy();
-      window.removeEventListener("resize", onResize);
-    };
-  }, []);
-
-  /* --- interactions pointeur --- */
-  const onPointerDown = useCallback((e: ReactPointerEvent) => {
-    dragging.current = true;
-    lastX.current = e.clientX;
-    velocity.current = 0;
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-  }, []);
-
-  const onPointerMove = useCallback((e: ReactPointerEvent) => {
-    const el = e.currentTarget as HTMLElement;
-    const rect = el.getBoundingClientRect();
-    /* parallaxe magnétique : offset normalisé -1..1 */
-    pointerOffset.current = {
-      x: ((e.clientX - rect.left) / rect.width - 0.5) * 2,
-      y: ((e.clientY - rect.top) / rect.height - 0.5) * 2,
-    };
-    if (dragging.current) {
-      const dx = e.clientX - lastX.current;
-      lastX.current = e.clientX;
-      phi.current += dx * 0.005;
-      velocity.current = dx * 0.005;
-    }
-  }, []);
-
-  const onPointerUp = useCallback(() => {
-    dragging.current = false;
-  }, []);
-
-  const onPointerLeave = useCallback(() => {
-    dragging.current = false;
-    pointerOffset.current = { x: 0, y: 0 };
-  }, []);
-
+function GlobeCanvas() {
   return (
     <div
       className="absolute -right-[16vw] top-1/2 -translate-y-1/2 md:-right-[8vw]"
@@ -503,18 +199,10 @@ const GlobeCanvas = memo(function GlobeCanvas() {
             "radial-gradient(circle at 42% 38%, rgba(129,140,248,0.16), rgba(165,180,252,0.07) 45%, transparent 70%)",
         }}
       />
-      <canvas
-        ref={canvasRef}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerLeave={onPointerLeave}
-        className="h-full w-full cursor-grab opacity-95 active:cursor-grabbing"
-        style={{ contain: "layout paint size", touchAction: "none" }}
-      />
+      <GlobeScene />
     </div>
   );
-});
+}
 
 /* ============================================================
    5. CHAT — typographie pure, zéro étiquette

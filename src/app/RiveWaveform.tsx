@@ -9,7 +9,7 @@
 
 import { useEffect, useState } from "react";
 import { useRive, useStateMachineInput } from "@rive-app/react-canvas";
-import { useSuzanneStore } from "./page";
+import { useSuzanneStore } from "./store";
 
 const STATE_MACHINE = "State Machine 1";
 
