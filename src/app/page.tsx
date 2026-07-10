@@ -1,28 +1,12 @@
 "use client";
 
 /* ============================================================
-   SUZANNE — page.tsx (production, Next.js 14+ App Router)
+   SUZANNE — v4 « Cinématique »  ·  app/page.tsx
    ------------------------------------------------------------
-   Monolithique volontairement : à coller dans app/page.tsx.
-   
-   Dépendances à installer :
-     npm install zustand cobe framer-motion
-     npx shadcn@latest init   (pour la base Tailwind/Radix)
-     npm install @rive-app/react-canvas   (waveform finale)
-
-   Polices — dans app/layout.tsx :
-     import { GeistSans } from "geist/font/sans";
-     // ou : import { Inter } from "next/font/google";
-     // const inter = Inter({ subsets: ["latin"], display: "swap" });
-     <body className={GeistSans.className}> → zéro CLS.
-
-   Architecture :
-   - Zustand store : status / messages / currentResponseText
-   - Sélecteurs atomiques → le Globe et la Waveform ne re-render
-     JAMAIS pendant le streaming des tokens (seul <StreamingText>
-     s'abonne à currentResponseText).
-   - cobe : vitesse pilotée via ref mutable dans onRender,
-     le contexte WebGL n'est jamais ré-instancié.
+   Globe cobe hyper-interactif : drag + inertie, parallaxe
+   magnétique, cinématique d'états, marqueurs évolutifs,
+   micro-impulsions de zoom synchronisées au streaming.
+   Rive waveform réelle intégrée dans la command bar.
    ============================================================ */
 
 import {
@@ -32,32 +16,36 @@ import {
   useCallback,
   memo,
   type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
-import createGlobe from "cobe";
+import createGlobe, { type Marker } from "cobe";
 import { motion, AnimatePresence } from "framer-motion";
+import { useRive, useStateMachineInput } from "@rive-app/react-canvas";
 
 /* ============================================================
-   1. STORE ZUSTAND — état global, abonnements atomiques
+   1. STORE ZUSTAND
    ============================================================ */
 
 type SuzanneStatus = "idle" | "thinking" | "speaking";
 
 interface Message {
   id: string;
-  role: "user" | "assistant";
   text: string;
+  isUser: boolean;
 }
 
 interface SuzanneStore {
   status: SuzanneStatus;
   messages: Message[];
-  /** Texte en cours de streaming — SEUL StreamingText s'y abonne. */
   currentResponseText: string;
+  /** Compteur incrémenté à chaque token streamé — le globe s'y
+      abonne hors-React pour ses micro-impulsions de zoom. */
+  tokenPulse: number;
   setStatus: (s: SuzanneStatus) => void;
   addMessage: (m: Message) => void;
-  setCurrentResponseText: (t: string) => void;
+  streamToken: (fullText: string) => void;
   commitResponse: () => void;
 }
 
@@ -66,20 +54,25 @@ export const useSuzanneStore = create<SuzanneStore>((set, get) => ({
   messages: [
     {
       id: "welcome",
-      role: "assistant",
-      text: "Bonjour. Je suis Suzanne, ton assistante locale. Écris-moi quelque chose pour voir mes états en action.",
+      text: "Bonjour. Je suis Suzanne. Fais glisser le globe, survole-le, et écris-moi pour voir mes états en action.",
+      isUser: false,
     },
   ],
   currentResponseText: "",
+  tokenPulse: 0,
   setStatus: (status) => set({ status }),
   addMessage: (m) => set((s) => ({ messages: [...s.messages, m] })),
-  setCurrentResponseText: (currentResponseText) => set({ currentResponseText }),
+  streamToken: (fullText) =>
+    set((s) => ({
+      currentResponseText: fullText,
+      tokenPulse: s.tokenPulse + 1,
+    })),
   commitResponse: () => {
     const { currentResponseText, messages } = get();
     set({
       messages: [
         ...messages,
-        { id: crypto.randomUUID(), role: "assistant", text: currentResponseText },
+        { id: crypto.randomUUID(), text: currentResponseText, isUser: false },
       ],
       currentResponseText: "",
       status: "idle",
@@ -88,36 +81,30 @@ export const useSuzanneStore = create<SuzanneStore>((set, get) => ({
 }));
 
 /* ============================================================
-   2. useStreamText — émulation de l'arrivée des tokens.
+   2. STREAMING SIMULÉ
    ------------------------------------------------------------
-   ⚠️ INTÉGRATION OLLAMA : remplacer le corps de `stream()` par :
-     const res = await fetch("http://localhost:11434/api/chat", {
-       method: "POST",
-       body: JSON.stringify({ model: "qwen2.5:14b", messages, stream: true }),
-     });
-     const reader = res.body!.getReader(); // puis décoder les chunks
-   La structure du hook (setCurrentResponseText token par token,
-   commitResponse à la fin) reste identique.
+   🔌 OLLAMA : remplacer le corps par un fetch streaming vers
+   http://localhost:11434/api/chat — la structure (streamToken
+   par chunk, commitResponse à la fin) reste identique.
    ============================================================ */
 
 const FAKE_REPLIES = [
-  "Bonjour Thomas. Ton serveur tourne parfaitement — la RX 6750 XT est à 42°C et la VRAM n'est utilisée qu'à 60 %. Que puis-je faire pour toi ?",
-  "Pour le dual-boot Ubuntu, je te recommande 250 Go en ext4, avec 16 Go de swap. Je peux te détailler le partitionnement si tu veux.",
-  "ROCm est l'écosystème open-source d'AMD. Il permet à Ollama de dialoguer directement avec les 12 Go de VRAM de ta carte graphique.",
-  "Bien noté. J'ai mémorisé cette préférence dans ma base vectorielle pour nos prochaines conversations.",
+  "Ton serveur tourne parfaitement. La RX 6750 XT est à 42°C, la VRAM utilisée à 60 %. Que puis-je faire pour toi ?",
+  "Pour le dual-boot Ubuntu, pars sur 250 Go en ext4 avec 16 Go de swap. Je peux détailler le partitionnement si tu veux.",
+  "ROCm permet à Ollama de dialoguer directement avec les 12 Go de VRAM de ta carte graphique, sans passer par le CPU.",
+  "C'est noté. Je viens de l'enregistrer dans ma mémoire vectorielle — je m'en souviendrai la prochaine fois.",
 ];
 
 function useStreamText() {
   const replyIdx = useRef(0);
   const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
-
   useEffect(() => () => timers.current.forEach(clearTimeout), []);
 
   const stream = useCallback((userText: string) => {
-    const { setStatus, addMessage, setCurrentResponseText, commitResponse } =
+    const { setStatus, addMessage, streamToken, commitResponse } =
       useSuzanneStore.getState();
 
-    addMessage({ id: crypto.randomUUID(), role: "user", text: userText });
+    addMessage({ id: crypto.randomUUID(), text: userText, isUser: true });
     setStatus("thinking");
 
     const reply = FAKE_REPLIES[replyIdx.current++ % FAKE_REPLIES.length];
@@ -129,14 +116,13 @@ function useStreamText() {
         let i = 0;
         const iv = setInterval(() => {
           i++;
-          // Seul <StreamingText> re-render ici — pas le Globe, pas la bar.
-          setCurrentResponseText(words.slice(0, i).join(" "));
+          streamToken(words.slice(0, i).join(" "));
           if (i >= words.length) {
             clearInterval(iv);
-            timers.current.push(setTimeout(commitResponse, 500));
+            timers.current.push(setTimeout(commitResponse, 450));
           }
-        }, 80);
-      }, 1800)
+        }, 85);
+      }, 2200)
     );
   }, []);
 
@@ -144,31 +130,80 @@ function useStreamText() {
 }
 
 /* ============================================================
-   3. GLOBE (cobe) — isolé, memo, ZÉRO re-render pendant stream.
-   ------------------------------------------------------------
-   La vitesse est lue depuis une ref mutable mise à jour par un
-   abonnement Zustand hors-React (`subscribe`) : le contexte
-   WebGL vit une seule fois, onRender lit rotation.current.
+   3. GLOBE COBE — hyper-interactif, zéro re-render React
    ============================================================ */
+
+const FRANCE: Marker = { location: [46.6, 2.35], size: 0.08 };
+
+function randomMarker(): Marker & { born: number } {
+  return {
+    location: [(Math.random() - 0.5) * 140, (Math.random() - 0.5) * 340],
+    size: 0.03 + Math.random() * 0.04,
+    born: performance.now(),
+  };
+}
 
 const GlobeCanvas = memo(function GlobeCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const rotation = useRef(0);
+
+  /* --- refs mutables lues par onRender (jamais de re-render) --- */
+  const phi = useRef(0);
   const speed = useRef(0.003);
   const targetSpeed = useRef(0.003);
-  const glowPulse = useRef(0);
+  const theta = useRef(0.25);
+  const targetTheta = useRef(0.25);
+  const zoomPulse = useRef(0); // micro-impulsion par token
+  const heartbeat = useRef(0);
+  const status = useRef<SuzanneStatus>("idle");
+
+  /* drag + inertie */
+  const dragging = useRef(false);
+  const lastX = useRef(0);
+  const velocity = useRef(0);
+
+  /* parallaxe magnétique */
+  const pointerOffset = useRef({ x: 0, y: 0 });
+
+  /* marqueurs éphémères */
+  const ephemeral = useRef<(Marker & { born: number })[]>([]);
+  const markerTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    // Abonnement HORS cycle React : aucun re-render du composant.
-    const unsub = useSuzanneStore.subscribe((state) => {
-      targetSpeed.current =
-        state.status === "thinking"
-          ? 0.014
-          : state.status === "speaking"
-          ? 0.006
-          : 0.003;
+    /* Abonnements hors cycle React */
+    const unsub = useSuzanneStore.subscribe((state, prev) => {
+      status.current = state.status;
+
+      /* micro-impulsion de zoom à chaque token streamé */
+      if (state.tokenPulse !== prev.tokenPulse) zoomPulse.current = 1;
+
+      /* cinématique des états */
+      if (state.status === "thinking") {
+        targetSpeed.current = 0.016;
+        targetTheta.current = 0.85; // bascule vers le pôle nord
+        if (!markerTimer.current) {
+          markerTimer.current = setInterval(() => {
+            if (ephemeral.current.length < 14)
+              ephemeral.current.push(randomMarker());
+          }, 220);
+        }
+      } else {
+        if (markerTimer.current) {
+          clearInterval(markerTimer.current);
+          markerTimer.current = null;
+        }
+        if (state.status === "speaking") {
+          targetSpeed.current = 0.006;
+          targetTheta.current = 0.3;
+        } else {
+          targetSpeed.current = 0.003;
+          targetTheta.current = 0.25;
+        }
+      }
     });
-    return unsub;
+    return () => {
+      unsub();
+      if (markerTimer.current) clearInterval(markerTimer.current);
+    };
   }, []);
 
   useEffect(() => {
@@ -187,23 +222,65 @@ const GlobeCanvas = memo(function GlobeCanvas() {
       theta: 0.25,
       dark: 0,
       diffuse: 1.2,
-      mapSamples: 24000,
-      mapBrightness: 4,
-      baseColor: [0.92, 0.92, 0.95],
+      mapSamples: 26000,
+      mapBrightness: 4.2,
+      baseColor: [0.93, 0.93, 0.96],
       markerColor: [99 / 255, 102 / 255, 241 / 255],
-      glowColor: [0.85, 0.86, 0.98],
-      markers: [
-        { location: [48.8566, 2.3522], size: 0.06 }, // Paris — Suzanne est là
-        { location: [37.7749, -122.4194], size: 0.04 },
-        { location: [35.6762, 139.6503], size: 0.04 },
-        { location: [-33.8688, 151.2093], size: 0.03 },
-      ],
+      glowColor: [0.86, 0.87, 0.99],
+      scale: 1,
+      markers: [FRANCE],
       onRender: (state) => {
-        // Lissage de la vitesse — jamais de saut visuel entre états.
-        speed.current += (targetSpeed.current - speed.current) * 0.04;
-        rotation.current += speed.current;
-        state.phi = rotation.current;
-        glowPulse.current += 0.05;
+        const now = performance.now();
+        const s = status.current;
+
+        /* --- inertie du drag : friction douce --- */
+        if (!dragging.current) {
+          if (Math.abs(velocity.current) > 0.0002) {
+            phi.current += velocity.current;
+            velocity.current *= 0.94; // friction
+          } else {
+            velocity.current = 0;
+            /* lissage vitesse auto + rotation */
+            speed.current += (targetSpeed.current - speed.current) * 0.045;
+            phi.current += speed.current;
+          }
+        }
+
+        /* --- inclinaison d'axe (état) + parallaxe magnétique --- */
+        theta.current += (targetTheta.current - theta.current) * 0.03;
+        const parallaxTheta = pointerOffset.current.y * 0.12;
+        const parallaxPhi = pointerOffset.current.x * 0.1;
+
+        /* --- battement de cœur en thinking --- */
+        heartbeat.current += 0.055;
+        const beat =
+          s === "thinking"
+            ? Math.pow(Math.max(0, Math.sin(heartbeat.current * 2.4)), 6) * 0.5
+            : 0;
+
+        /* --- micro-impulsion de zoom (token) : décroissance --- */
+        zoomPulse.current *= 0.86;
+        const pulseScale =
+          s === "speaking" ? 1 + zoomPulse.current * 0.035 : 1;
+
+        /* --- marqueurs éphémères : fade-out --- */
+        const fadeSpan = s === "thinking" ? 2600 : 700; // s'estompent vite quand elle parle
+        ephemeral.current = ephemeral.current.filter(
+          (m) => now - m.born < fadeSpan
+        );
+        const markers: Marker[] = [
+          FRANCE,
+          ...ephemeral.current.map((m) => ({
+            location: m.location,
+            size: m.size * Math.max(0, 1 - (now - m.born) / fadeSpan),
+          })),
+        ];
+
+        state.phi = phi.current + parallaxPhi;
+        state.theta = theta.current + parallaxTheta;
+        state.scale = pulseScale;
+        state.mapBrightness = 4.2 + beat * 2.2;
+        state.markers = markers;
         state.width = width * 2;
         state.height = width * 2;
       },
@@ -215,113 +292,115 @@ const GlobeCanvas = memo(function GlobeCanvas() {
     };
   }, []);
 
+  /* --- interactions pointeur --- */
+  const onPointerDown = useCallback((e: ReactPointerEvent) => {
+    dragging.current = true;
+    lastX.current = e.clientX;
+    velocity.current = 0;
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  }, []);
+
+  const onPointerMove = useCallback((e: ReactPointerEvent) => {
+    const el = e.currentTarget as HTMLElement;
+    const rect = el.getBoundingClientRect();
+    /* parallaxe magnétique : offset normalisé -1..1 */
+    pointerOffset.current = {
+      x: ((e.clientX - rect.left) / rect.width - 0.5) * 2,
+      y: ((e.clientY - rect.top) / rect.height - 0.5) * 2,
+    };
+    if (dragging.current) {
+      const dx = e.clientX - lastX.current;
+      lastX.current = e.clientX;
+      phi.current += dx * 0.005;
+      velocity.current = dx * 0.005;
+    }
+  }, []);
+
+  const onPointerUp = useCallback(() => {
+    dragging.current = false;
+  }, []);
+
+  const onPointerLeave = useCallback(() => {
+    dragging.current = false;
+    pointerOffset.current = { x: 0, y: 0 };
+  }, []);
+
   return (
     <div
-      className="pointer-events-none absolute -right-[18vw] top-1/2 -translate-y-1/2 md:-right-[10vw]"
-      style={{ width: "80vmin", height: "80vmin", minWidth: 480 }}
-      aria-hidden="true"
+      className="absolute -right-[16vw] top-1/2 -translate-y-1/2 md:-right-[8vw]"
+      style={{ width: "88vmin", height: "88vmin", minWidth: 520 }}
     >
+      {/* halo cristallin diffus sous le globe */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-[6%] rounded-full opacity-70 blur-3xl"
+        style={{
+          background:
+            "radial-gradient(circle at 42% 38%, rgba(129,140,248,0.16), rgba(165,180,252,0.07) 45%, transparent 70%)",
+        }}
+      />
       <canvas
         ref={canvasRef}
-        className="h-full w-full opacity-90"
-        style={{ contain: "layout paint size" }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={onPointerLeave}
+        className="h-full w-full cursor-grab opacity-95 active:cursor-grabbing"
+        style={{ contain: "layout paint size", touchAction: "none" }}
       />
     </div>
   );
 });
 
 /* ============================================================
-   4. VISUAL WAVEFORM — remplacement safe (SVG + framer-motion).
-   ------------------------------------------------------------
-   🔌 INJECTION RIVE FINALE — remplacer ce composant par :
-
-     import { useRive, useStateMachineInput } from "@rive-app/react-canvas";
-
-     function RiveWaveform() {
-       const speaking = useSuzanneStore((s) => s.status === "speaking");
-       const { rive, RiveComponent } = useRive({
-         src: "/waveform.riv",               // fichier dans /public
-         stateMachines: "StateMachine 1",    // nom exact
-         autoplay: true,
-       });
-       const isActive = useStateMachineInput(rive, "StateMachine 1", "isActive", false);
-       useEffect(() => { if (isActive) isActive.value = speaking; }, [speaking, isActive]);
-       return <RiveComponent className="h-16 w-full" />;
-     }
+   4. RIVE WAVEFORM — onde sonore réelle dans la capsule
    ============================================================ */
 
-const WAVE_PATHS = {
-  flat: "M0,32 C80,32 160,32 240,32 C320,32 400,32 480,32 C560,32 640,32 720,32",
-  a: "M0,32 C60,12 120,52 180,30 C240,8 300,50 360,34 C420,18 480,48 540,28 C600,10 660,46 720,32",
-  b: "M0,32 C60,50 120,14 180,36 C240,54 300,16 360,30 C420,44 480,12 540,38 C600,52 660,20 720,32",
-};
+const STATE_MACHINE = "StateMachine 1";
 
-const VisualWaveform = memo(function VisualWaveform() {
-  // Abonnement atomique : re-render uniquement quand `speaking` bascule.
+function RiveWaveform() {
   const speaking = useSuzanneStore((s) => s.status === "speaking");
+  const { rive, RiveComponent } = useRive({
+    src: "/waveform.riv",
+    stateMachines: STATE_MACHINE,
+    autoplay: true,
+  });
+  const isActive = useStateMachineInput(rive, STATE_MACHINE, "isActive", false);
+
+  useEffect(() => {
+    if (isActive) isActive.value = speaking;
+  }, [speaking, isActive]);
 
   return (
-    <div className="h-16 w-full overflow-hidden" aria-hidden="true">
-      <svg
-        viewBox="0 0 720 64"
-        preserveAspectRatio="none"
-        className="h-full w-full"
-      >
-        {[0.55, 0.28, 0.16].map((opacity, i) => (
-          <motion.path
-            key={i}
-            fill="none"
-            stroke="rgb(99 102 241)"
-            strokeWidth={1.8 - i * 0.4}
-            strokeOpacity={speaking ? opacity : 0.08}
-            initial={{ d: WAVE_PATHS.flat }}
-            animate={
-              speaking
-                ? { d: [WAVE_PATHS.a, WAVE_PATHS.b, WAVE_PATHS.a] }
-                : { d: WAVE_PATHS.flat }
-            }
-            transition={
-              speaking
-                ? {
-                    duration: 1.4 + i * 0.35,
-                    repeat: Infinity,
-                    ease: "easeInOut",
-                  }
-                : { type: "spring", stiffness: 120, damping: 20 }
-            }
-          />
-        ))}
-      </svg>
+    <div className="h-10 w-32 shrink-0" aria-hidden="true">
+      <RiveComponent style={{ width: "100%", height: "100%" }} />
     </div>
   );
-});
+}
 
 /* ============================================================
-   5. MESSAGES — spring physics, streaming isolé
+   5. CHAT — typographie pure, zéro étiquette
    ============================================================ */
 
-const springTransition = {
+const spring = {
   type: "spring" as const,
-  stiffness: 260,
+  stiffness: 250,
   damping: 26,
   mass: 0.8,
 };
 
 const MessageItem = memo(function MessageItem({ msg }: { msg: Message }) {
-  const isUser = msg.role === "user";
   return (
     <motion.div
       layout
-      initial={{ opacity: 0, y: 16, scale: 0.98 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      transition={springTransition}
+      initial={{ opacity: 0, y: 14 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={spring}
+      className={msg.isUser ? "self-end pl-16 text-right" : "self-start pr-16"}
     >
-      <p className="mb-2 text-[10px] font-medium uppercase tracking-widest text-neutral-400">
-        {isUser ? "Vous" : "Suzanne"}
-      </p>
       <p
-        className={`max-w-prose text-lg leading-relaxed ${
-          isUser ? "text-neutral-400" : "text-neutral-900 dark:text-neutral-50"
+        className={`text-lg leading-relaxed ${
+          msg.isUser ? "text-neutral-500" : "text-neutral-900"
         }`}
       >
         {msg.text}
@@ -330,22 +409,18 @@ const MessageItem = memo(function MessageItem({ msg }: { msg: Message }) {
   );
 });
 
-/** Seul composant abonné à currentResponseText → seul à re-render
-    à chaque token. Le Globe/Waveform/CommandBar restent figés. */
 function StreamingText() {
   const text = useSuzanneStore((s) => s.currentResponseText);
   const speaking = useSuzanneStore((s) => s.status === "speaking");
   if (!speaking || !text) return null;
   return (
     <motion.div
-      initial={{ opacity: 0, y: 16 }}
+      initial={{ opacity: 0, y: 14 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={springTransition}
+      transition={spring}
+      className="self-start pr-16"
     >
-      <p className="mb-2 text-[10px] font-medium uppercase tracking-widest text-indigo-400">
-        Suzanne
-      </p>
-      <p className="max-w-prose text-lg leading-relaxed text-neutral-900 dark:text-neutral-50">
+      <p className="text-lg leading-relaxed text-neutral-900">
         {text}
         <span className="ml-0.5 inline-block h-4 w-[2px] animate-pulse bg-indigo-400 align-middle" />
       </p>
@@ -358,32 +433,27 @@ function ThinkingIndicator() {
   return (
     <AnimatePresence>
       {thinking && (
-        <motion.p
+        <motion.span
           initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
+          animate={{ opacity: [0.2, 0.9, 0.2] }}
           exit={{ opacity: 0 }}
-          className="text-sm text-neutral-300"
+          transition={{ duration: 1.3, repeat: Infinity }}
+          className="self-start text-sm text-neutral-300"
         >
-          <motion.span
-            animate={{ opacity: [0.2, 1, 0.2] }}
-            transition={{ duration: 1.2, repeat: Infinity }}
-          >
-            ● ● ●
-          </motion.span>
-        </motion.p>
+          ● ● ●
+        </motion.span>
       )}
     </AnimatePresence>
   );
 }
 
 /* ============================================================
-   6. COMMAND BAR — logique Radix/shadcn : clavier complet.
-   Entrée = envoyer · Maj+Entrée = nouvelle ligne · Échap = blur
+   6. COMMAND BAR — capsule vitrée minimale
    ============================================================ */
 
 function CommandBar() {
   const [value, setValue] = useState("");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const idle = useSuzanneStore((s) => s.status === "idle");
   const { stream } = useStreamText();
 
@@ -395,15 +465,9 @@ function CommandBar() {
   }, [value, idle, stream]);
 
   const onKeyDown = useCallback(
-    (e: KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        send();
-      }
-      if (e.key === "Escape") {
-        textareaRef.current?.blur();
-      }
-      // Maj+Entrée : comportement natif du textarea (nouvelle ligne)
+    (e: KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === "Enter") send();
+      if (e.key === "Escape") inputRef.current?.blur();
     },
     [send]
   );
@@ -411,69 +475,64 @@ function CommandBar() {
   return (
     <div className="absolute inset-x-0 bottom-6 z-20 flex justify-center px-6">
       <motion.div
-        initial={{ opacity: 0, y: 24 }}
+        initial={{ opacity: 0, y: 22 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ ...springTransition, delay: 0.15 }}
-        className="w-full max-w-2xl rounded-2xl border border-neutral-200/50 bg-white/70 shadow-2xl shadow-neutral-200/50 backdrop-blur-md dark:border-neutral-800/50 dark:bg-black/70 dark:shadow-black/30"
+        transition={{ ...spring, delay: 0.15 }}
+        className="flex w-full max-w-xl items-center gap-3 rounded-full border border-neutral-200/50 bg-white/70 py-1.5 pl-5 pr-2 shadow-2xl shadow-neutral-200/60 backdrop-blur-md"
       >
-        <VisualWaveform />
-        <div className="flex items-end gap-3 px-5 pb-4">
-          <textarea
-            ref={textareaRef}
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            onKeyDown={onKeyDown}
-            placeholder="Écrire à Suzanne…"
-            aria-label="Écrire à Suzanne"
-            rows={1}
-            disabled={!idle}
-            className="max-h-32 flex-1 resize-none bg-transparent text-[15px] leading-6 text-neutral-900 outline-none placeholder:text-neutral-300 disabled:opacity-50 dark:text-neutral-50"
-          />
-          <motion.button
-            whileTap={{ scale: 0.92 }}
-            onClick={send}
-            disabled={!idle || !value.trim()}
-            aria-label="Envoyer"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-neutral-900 text-sm text-white transition-colors hover:bg-indigo-600 disabled:bg-neutral-200 dark:bg-neutral-50 dark:text-neutral-900 dark:disabled:bg-neutral-800"
-          >
-            ↑
-          </motion.button>
-        </div>
+        <input
+          ref={inputRef}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={onKeyDown}
+          placeholder="Écrire à Suzanne…"
+          aria-label="Écrire à Suzanne"
+          disabled={!idle}
+          className="min-w-0 flex-1 bg-transparent text-[15px] text-neutral-900 outline-none placeholder:text-neutral-300 disabled:opacity-50"
+        />
+        <RiveWaveform />
+        <motion.button
+          whileTap={{ scale: 0.9 }}
+          onClick={send}
+          disabled={!idle || !value.trim()}
+          aria-label="Envoyer"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-neutral-900 text-sm text-white transition-colors hover:bg-indigo-600 disabled:bg-neutral-200"
+        >
+          ↑
+        </motion.button>
       </motion.div>
     </div>
   );
 }
 
 /* ============================================================
-   7. HEADER — statut atomique
+   7. HEADER — titre seul + statut discret
    ============================================================ */
 
 function StatusIndicator() {
   const status = useSuzanneStore((s) => s.status);
   const label =
     status === "thinking"
-      ? "Suzanne réfléchit"
+      ? "Réflexion"
       : status === "speaking"
-      ? "Suzanne répond"
+      ? "Parle"
       : "En veille";
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex items-center gap-2 opacity-50">
       <motion.span
         animate={
-          status === "thinking"
-            ? { opacity: [0.2, 1, 0.2] }
-            : { opacity: 1 }
+          status === "thinking" ? { opacity: [0.3, 1, 0.3] } : { opacity: 1 }
         }
         transition={
           status === "thinking"
-            ? { duration: 0.8, repeat: Infinity }
+            ? { duration: 0.9, repeat: Infinity }
             : undefined
         }
         className={`h-1.5 w-1.5 rounded-full ${
-          status === "idle" ? "bg-neutral-300" : "bg-indigo-500"
+          status === "idle" ? "bg-neutral-400" : "bg-indigo-500"
         }`}
       />
-      <span className="text-[11px] text-neutral-400">{label}</span>
+      <span className="text-xs text-neutral-500">{label}</span>
     </div>
   );
 }
@@ -484,8 +543,8 @@ function StatusIndicator() {
 
 export default function SuzannePage() {
   const messages = useSuzanneStore(useShallow((s) => s.messages));
-  const scrollRef = useRef<HTMLDivElement>(null);
   const currentLen = useSuzanneStore((s) => s.currentResponseText.length);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -495,26 +554,21 @@ export default function SuzannePage() {
   }, [messages.length, currentLen]);
 
   return (
-    <div className="relative h-screen w-full overflow-hidden bg-[#FAFAFA] font-sans antialiased dark:bg-neutral-950">
+    <div className="relative h-screen w-full overflow-hidden bg-[#FAFAFA] font-sans antialiased">
       <GlobeCanvas />
 
       <header className="relative z-10 flex items-center justify-between px-8 py-6 md:px-16">
-        <div className="flex items-baseline gap-3">
-          <h1 className="text-lg font-semibold tracking-tight text-neutral-900 dark:text-neutral-50">
-            Suzanne
-          </h1>
-          <span className="text-[11px] text-neutral-400">
-            serveur local · privé
-          </span>
-        </div>
+        <h1 className="text-lg font-semibold tracking-tight text-neutral-900">
+          Suzanne
+        </h1>
         <StatusIndicator />
       </header>
 
       <main
         ref={scrollRef}
-        className="relative z-10 h-[calc(100vh-88px)] overflow-y-auto px-8 pb-56 pt-4 md:px-16"
+        className="relative z-10 h-[calc(100vh-84px)] overflow-y-auto px-8 pb-48 pt-2 md:px-16"
       >
-        <div className="flex max-w-xl flex-col gap-14">
+        <div className="flex max-w-xl flex-col gap-16">
           {messages.map((m) => (
             <MessageItem key={m.id} msg={m} />
           ))}
@@ -524,10 +578,6 @@ export default function SuzannePage() {
       </main>
 
       <CommandBar />
-
-      <p className="absolute bottom-1.5 left-1/2 z-20 -translate-x-1/2 text-[10px] text-neutral-300">
-        100 % local · vos données ne quittent jamais votre machine
-      </p>
     </div>
   );
 }
