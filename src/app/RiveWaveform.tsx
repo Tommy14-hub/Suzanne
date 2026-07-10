@@ -10,7 +10,8 @@ import { useEffect } from "react";
 import { useRive, useStateMachineInput } from "@rive-app/react-canvas";
 import { useSuzanneStore } from "./page";
 
-const STATE_MACHINE = "StateMachine 1";
+// ⚠️ Nom EXACT lu dans le binaire du .riv : "State Machine 1" (avec espace)
+const STATE_MACHINE = "State Machine 1";
 
 export default function RiveWaveform() {
   const speaking = useSuzanneStore((s) => s.status === "speaking");

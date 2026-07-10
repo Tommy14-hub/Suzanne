@@ -24,6 +24,12 @@ import createGlobe, { type Marker } from "cobe";
 import { motion, AnimatePresence } from "framer-motion";
 import dynamic from "next/dynamic";
 import { GlyphMatrix } from "./GlyphMatrix";
+import {
+  makeLink,
+  resolveGlobeIntent,
+  type NetLink,
+  type GlobeIntent,
+} from "./networkSim";
 
 /* Rive chargé uniquement côté client (évite tout crash SSR au build Vercel) */
 const RiveWaveform = dynamic(() => import("./RiveWaveform"), {
@@ -48,11 +54,13 @@ interface SuzanneStore {
   messages: Message[];
   currentResponseText: string;
   tokenPulse: number;
+  globeIntent: GlobeIntent | null;
   setStatus: (s: SuzanneStatus) => void;
   addMessage: (m: Message) => void;
   streamToken: (fullText: string) => void;
   commitResponse: (text: string) => void;
   finishSpeaking: () => void;
+  setGlobeIntent: (i: GlobeIntent | null) => void;
 }
 
 export const useSuzanneStore = create<SuzanneStore>((set, get) => ({
@@ -66,8 +74,10 @@ export const useSuzanneStore = create<SuzanneStore>((set, get) => ({
   ],
   currentResponseText: "",
   tokenPulse: 0,
+  globeIntent: null,
   setStatus: (status) => set({ status }),
   addMessage: (m) => set((s) => ({ messages: [...s.messages, m] })),
+  setGlobeIntent: (globeIntent) => set({ globeIntent }),
   streamToken: (fullText) =>
     set((s) => ({
       currentResponseText: fullText,
@@ -196,21 +206,21 @@ function useStreamText() {
   useEffect(() => () => timers.current.forEach(clearTimeout), []);
 
   const stream = useCallback((userText: string) => {
-    const { setStatus, addMessage, commitResponse } =
+    const { setStatus, addMessage, commitResponse, setGlobeIntent } =
       useSuzanneStore.getState();
 
     addMessage({ id: crypto.randomUUID(), text: userText, isUser: true });
+    // choisit l'animation du globe selon le contenu du message
+    setGlobeIntent(resolveGlobeIntent(userText));
     setStatus("thinking");
 
     const reply = generateReply(userText);
-    // temps de "réflexion" proportionnel à la longueur (plus vivant)
-    const thinkMs = 900 + Math.min(1600, reply.length * 12);
+    const thinkMs = 2000 + Math.min(2000, reply.length * 14);
 
     timers.current.push(
       setTimeout(() => {
-        // La réponse complète est posée d'un coup ; HyperText l'anime
-        // une seule fois (plus de dédoublement streaming + commit).
         commitResponse(reply);
+        setGlobeIntent(null); // fin de la recherche visuelle
       }, thinkMs)
     );
   }, []);
@@ -260,10 +270,17 @@ const GlobeCanvas = memo(function GlobeCanvas() {
   const ephemeral = useRef<(Marker & { born: number })[]>([]);
   const markerTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  /* overlay réseau (arcs IP, satellite, ping) */
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+  const links = useRef<NetLink[]>([]);
+  const linkTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const intent = useRef<GlobeIntent | null>(null);
+
   useEffect(() => {
     /* Abonnements hors cycle React */
     const unsub = useSuzanneStore.subscribe((state, prev) => {
       status.current = state.status;
+      intent.current = state.globeIntent;
 
       /* micro-impulsion de zoom à chaque token streamé */
       if (state.tokenPulse !== prev.tokenPulse) zoomPulse.current = 1;
@@ -272,6 +289,26 @@ const GlobeCanvas = memo(function GlobeCanvas() {
       if (state.status === "thinking") {
         targetSpeed.current = 0.016;
         targetTheta.current = 0.85; // bascule vers le pôle nord
+
+        /* génère un trafic réseau intense selon le mode d'intent */
+        if (!linkTimer.current) {
+          const mode = state.globeIntent?.mode ?? "network";
+          const target = state.globeIntent?.target;
+          const spawn = () => {
+            if (mode === "ping" || mode === "satellite") {
+              // toutes les connexions convergent vers le pays cible
+              if (links.current.length < 8 && target) {
+                links.current.push(makeLink(undefined, target));
+              }
+            } else {
+              // trafic mondial dense
+              if (links.current.length < 12) links.current.push(makeLink());
+            }
+          };
+          spawn();
+          linkTimer.current = setInterval(spawn, mode === "network" ? 180 : 280);
+        }
+
         if (!markerTimer.current) {
           markerTimer.current = setInterval(() => {
             if (ephemeral.current.length < 14)
@@ -282,6 +319,10 @@ const GlobeCanvas = memo(function GlobeCanvas() {
         if (markerTimer.current) {
           clearInterval(markerTimer.current);
           markerTimer.current = null;
+        }
+        if (linkTimer.current) {
+          clearInterval(linkTimer.current);
+          linkTimer.current = null;
         }
         if (state.status === "speaking") {
           targetSpeed.current = 0.006;
@@ -295,6 +336,7 @@ const GlobeCanvas = memo(function GlobeCanvas() {
     return () => {
       unsub();
       if (markerTimer.current) clearInterval(markerTimer.current);
+      if (linkTimer.current) clearInterval(linkTimer.current);
     };
   }, []);
 
@@ -394,8 +436,164 @@ const GlobeCanvas = memo(function GlobeCanvas() {
       },
     });
 
+    /* ========================================================
+       OVERLAY RÉSEAU — projette les villes avec la MÊME rotation
+       que le globe (phi/theta) et dessine arcs, satellite, ping.
+       Canvas superposé, transparent, purement décoratif.
+       ======================================================== */
+    const overlay = overlayRef.current;
+    const octx = overlay?.getContext("2d") ?? null;
+    let oraf = 0;
+
+    /* projette lat/lng → point écran + z (profondeur) sur la sphère */
+    const projectGeo = (lat: number, lng: number, R: number, cx: number, cy: number) => {
+      const phase = phi.current;
+      // cobe : lng->longitude autour de Y, lat->latitude
+      const la = (lat * Math.PI) / 180;
+      const lo = (lng * Math.PI) / 180 + phase;
+      // point 3D sur sphère unité
+      const x = Math.cos(la) * Math.sin(lo);
+      const y = Math.sin(la);
+      const z = Math.cos(la) * Math.cos(lo);
+      // inclinaison (theta) autour de X
+      const t = theta.current;
+      const y2 = y * Math.cos(t) - z * Math.sin(t);
+      const z2 = y * Math.sin(t) + z * Math.cos(t);
+      return { x: cx + x * R, y: cy - y2 * R, z: z2 };
+    };
+
+    const drawOverlay = () => {
+      oraf = requestAnimationFrame(drawOverlay);
+      if (!overlay || !octx) return;
+      const now = performance.now();
+      const dpr = window.devicePixelRatio || 1;
+      const size = width;
+      if (overlay.width !== size * dpr) {
+        overlay.width = size * dpr;
+        overlay.height = size * dpr;
+      }
+      octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      octx.clearRect(0, 0, size, size);
+
+      const s = status.current;
+      if (s !== "thinking") {
+        // fade-out rapide des liens restants
+        links.current = links.current.filter((l) => now - l.born < l.ttl);
+      }
+      if (links.current.length === 0) return;
+
+      const cx = size / 2;
+      const cy = size / 2;
+      const R = size * 0.5 * 0.42 * scaleSmooth.current; // ~rayon du globe cobe
+      const mode = intent.current?.mode ?? "network";
+
+      // purge des liens expirés
+      links.current = links.current.filter((l) => now - l.born < l.ttl);
+
+      for (const link of links.current) {
+        const age = (now - link.born) / link.ttl; // 0..1
+        const a = projectGeo(link.from.lat, link.from.lng, R, cx, cy);
+        const b = projectGeo(link.to.lat, link.to.lng, R, cx, cy);
+
+        // opacité qui monte puis descend (cloche)
+        const env = Math.sin(age * Math.PI);
+
+        // arc en cloche entre a et b (point de contrôle surélevé)
+        const mx = (a.x + b.x) / 2;
+        const my = (a.y + b.y) / 2;
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const dist = Math.hypot(dx, dy);
+        // perpendiculaire pour bomber l'arc vers l'extérieur du globe
+        const nx = -dy / (dist || 1);
+        const ny = dx / (dist || 1);
+        const lift = dist * 0.35 + 20;
+        const ctrlX = mx + nx * lift;
+        const ctrlY = my + ny * lift;
+
+        // couleur selon le mode
+        const col =
+          mode === "satellite"
+            ? "34,197,94" // vert
+            : mode === "ping"
+            ? "244,114,182" // rose
+            : "99,102,241"; // indigo (network/scan)
+
+        // trait de l'arc
+        octx.beginPath();
+        octx.moveTo(a.x, a.y);
+        octx.quadraticCurveTo(ctrlX, ctrlY, b.x, b.y);
+        octx.strokeStyle = `rgba(${col},${0.5 * env})`;
+        octx.lineWidth = 1.2;
+        octx.stroke();
+
+        // paquet qui circule le long de l'arc (progression = age)
+        const p = age;
+        const qx =
+          (1 - p) * (1 - p) * a.x + 2 * (1 - p) * p * ctrlX + p * p * b.x;
+        const qy =
+          (1 - p) * (1 - p) * a.y + 2 * (1 - p) * p * ctrlY + p * p * b.y;
+        octx.beginPath();
+        octx.arc(qx, qy, 2, 0, Math.PI * 2);
+        octx.fillStyle = `rgba(${col},${0.9 * env})`;
+        octx.fill();
+
+        // points d'ancrage (villes) visibles seulement si face avant
+        for (const pt of [a, b]) {
+          if (pt.z > -0.1) {
+            octx.beginPath();
+            octx.arc(pt.x, pt.y, 1.6, 0, Math.PI * 2);
+            octx.fillStyle = `rgba(${col},${0.7 * env})`;
+            octx.fill();
+          }
+        }
+
+        // étiquette IP près du point de départ (petit, discret)
+        if (a.z > 0 && env > 0.3) {
+          octx.font = "9px ui-monospace, monospace";
+          octx.fillStyle = `rgba(${col},${0.6 * env})`;
+          octx.fillText(link.ip, a.x + 5, a.y - 4);
+        }
+      }
+
+      // SATELLITE : trace un faisceau depuis un point orbital vers la cible
+      if (mode === "satellite" && intent.current?.target) {
+        const tgt = intent.current.target;
+        const b = projectGeo(tgt.lat, tgt.lng, R, cx, cy);
+        if (b.z > -0.2) {
+          // position du satellite : au-dessus, oscille légèrement
+          const satX = cx + Math.sin(now / 900) * R * 0.5;
+          const satY = cy - R * 1.35;
+          const beat = 0.5 + 0.5 * Math.sin(now / 200);
+          // faisceau
+          octx.beginPath();
+          octx.moveTo(satX, satY);
+          octx.lineTo(b.x, b.y);
+          octx.strokeStyle = `rgba(34,197,94,${0.25 + beat * 0.35})`;
+          octx.lineWidth = 1;
+          octx.stroke();
+          // corps du satellite
+          octx.beginPath();
+          octx.arc(satX, satY, 3, 0, Math.PI * 2);
+          octx.fillStyle = "rgba(34,197,94,0.9)";
+          octx.fill();
+          octx.beginPath();
+          octx.arc(satX, satY, 7, 0, Math.PI * 2);
+          octx.strokeStyle = `rgba(34,197,94,${beat * 0.5})`;
+          octx.stroke();
+          // cible au sol : cercle de visée
+          octx.beginPath();
+          octx.arc(b.x, b.y, 6 + beat * 4, 0, Math.PI * 2);
+          octx.strokeStyle = `rgba(34,197,94,${0.6 * (1 - beat)})`;
+          octx.stroke();
+        }
+      }
+    };
+    oraf = requestAnimationFrame(drawOverlay);
+
     return () => {
       globe.destroy();
+      cancelAnimationFrame(oraf);
       window.removeEventListener("resize", onResize);
     };
   }, []);
@@ -455,6 +653,12 @@ const GlobeCanvas = memo(function GlobeCanvas() {
         onPointerLeave={onPointerLeave}
         className="h-full w-full cursor-grab opacity-95 active:cursor-grabbing"
         style={{ contain: "layout paint size", touchAction: "none" }}
+      />
+      {/* overlay réseau : arcs IP, satellite, ping — superposé, non interactif */}
+      <canvas
+        ref={overlayRef}
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 h-full w-full"
       />
     </div>
   );
@@ -588,18 +792,29 @@ const MessageItem = memo(function MessageItem({
 
 function ThinkingIndicator() {
   const thinking = useSuzanneStore((s) => s.status === "thinking");
+  const intent = useSuzanneStore((s) => s.globeIntent);
   return (
     <AnimatePresence>
       {thinking && (
-        <motion.span
+        <motion.div
           initial={{ opacity: 0 }}
-          animate={{ opacity: [0.2, 0.9, 0.2] }}
+          animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          transition={{ duration: 1.3, repeat: Infinity }}
-          className="self-start text-sm text-neutral-300"
+          className="flex items-center gap-3 self-start"
         >
-          ● ● ●
-        </motion.span>
+          <motion.span
+            animate={{ opacity: [0.2, 0.9, 0.2] }}
+            transition={{ duration: 1.3, repeat: Infinity }}
+            className="text-sm text-neutral-300"
+          >
+            ● ● ●
+          </motion.span>
+          {intent && (
+            <span className="font-mono text-xs text-neutral-400">
+              {intent.label}
+            </span>
+          )}
+        </motion.div>
       )}
     </AnimatePresence>
   );
