@@ -253,6 +253,16 @@ function HyperText({
     const start = performance.now();
     lastSettled.current = 0;
 
+    // Filet de sécurité : si la boucle rAF s'interrompt pour une raison
+    // externe (erreur ailleurs sur la page, tab en arrière-plan...), on
+    // force l'affichage final après un délai large — le texte ne reste
+    // JAMAIS bloqué à moitié brouillé.
+    const hardDeadline = (chars.length / speed) * 1000 + 1200;
+    const safety = setTimeout(() => {
+      setDisplay(text);
+      onSettle?.();
+    }, hardDeadline);
+
     const tick = (now: number) => {
       const elapsed = (now - start) / 1000;
       const settledCount = Math.floor(elapsed * speed);
@@ -260,7 +270,11 @@ function HyperText({
       // pulse le globe à chaque nouveau caractère fixé
       if (settledCount > lastSettled.current) {
         lastSettled.current = settledCount;
-        onProgress?.();
+        try {
+          onProgress?.();
+        } catch {
+          // n'interrompt jamais l'animation du texte
+        }
       }
 
       let done = true;
@@ -275,12 +289,16 @@ function HyperText({
       if (!done) {
         raf.current = requestAnimationFrame(tick);
       } else {
+        clearTimeout(safety);
         setDisplay(text);
         onSettle?.();
       }
     };
     raf.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf.current);
+    return () => {
+      cancelAnimationFrame(raf.current);
+      clearTimeout(safety);
+    };
     // onSettle/onProgress volontairement hors deps (refs stables)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, speed]);

@@ -52,12 +52,24 @@ export default function GlobeScene() {
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const measure = () =>
-      setSize(Math.min(el.clientWidth, el.clientHeight) || 560);
+    let raf = 0;
+    const measure = () => {
+      // debounce via rAF : évite de redimensionner le renderer WebGL
+      // à chaque micro-changement pendant les transitions CSS/Framer Motion
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const s = Math.min(el.clientWidth, el.clientHeight);
+        // plancher minimal : jamais de resize vers une taille quasi-nulle
+        if (s >= 50) setSize(s);
+      });
+    };
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
   }, []);
 
   /* --- contours des pays → hex polygons --- */
