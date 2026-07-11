@@ -24,10 +24,13 @@ export default function RiveWaveform() {
 
   const { rive, RiveComponent } = useRive({
     src: "/waveform.riv",
+    // ⚠️ CRUCIAL : le fichier a 3 artboards ("base", "inout", "compose").
+    // Seul "compose" possède l'input "isActive" — sans le préciser,
+    // Rive charge "base" par défaut, qui n'a AUCUN input, et isActive
+    // est silencieusement ignoré (c'était la cause de l'invisibilité).
+    artboard: "compose",
     stateMachines: STATE_MACHINE,
     autoplay: true,
-    // Fit.Contain : l'animation s'adapte au conteneur sans être coupée
-    // ni déformée, quel que soit le ratio de l'artboard d'origine.
     layout: new Layout({ fit: Fit.Contain, alignment: Alignment.Center }),
     onLoad: () => setRiveOk(true),
     onLoadError: () => setRiveFailed(true),
