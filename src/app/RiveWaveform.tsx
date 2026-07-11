@@ -2,8 +2,8 @@
 
 /* ============================================================
    WAVEFORM — barres animées quand Suzanne parle.
-   Le rendu CSS est TOUJOURS affiché quand speaking=true (visuel
-   garanti). Rive se superpose en bonus si le fichier se charge.
+   Rendu CSS garanti (indépendant de Rive). Rive se superpose
+   si le fichier .riv se charge correctement.
    ============================================================ */
 
 import { useEffect, useState } from "react";
@@ -29,26 +29,29 @@ export default function RiveWaveform() {
   }, [speaking, isActive]);
 
   return (
-    <div className="relative flex h-10 w-24 shrink-0 items-center justify-center" aria-hidden="true">
-      {/* Barres CSS — toujours visibles quand Suzanne parle */}
-      <div className="flex items-center justify-center gap-[3px]">
-        {Array.from({ length: 9 }).map((_, i) => (
+    <div
+      className="relative flex h-8 w-40 items-center justify-center"
+      aria-hidden="true"
+    >
+      {/* Barres CSS — visibles dès que Suzanne parle */}
+      <div className="flex h-full items-center justify-center gap-1">
+        {Array.from({ length: 13 }).map((_, i) => (
           <span
             key={i}
-            className="w-[3px] rounded-full bg-indigo-500"
+            className="w-1 rounded-full bg-indigo-500"
             style={{
-              height: 4,
+              height: speaking ? undefined : 4,
               animation: speaking
-                ? `suzanne-wave 0.9s ease-in-out ${i * 0.09}s infinite`
+                ? `suzanne-wave 0.85s ease-in-out ${i * 0.06}s infinite`
                 : "none",
-              opacity: speaking ? 1 : 0.25,
-              transition: "opacity 0.3s",
+              opacity: speaking ? 0.9 : 0.2,
+              transition: "opacity 0.3s, height 0.3s",
             }}
           />
         ))}
       </div>
 
-      {/* Rive en superposition (bonus, si dispo) */}
+      {/* Rive en superposition si dispo */}
       {riveOk && (
         <div className="absolute inset-0">
           <RiveComponent style={{ width: "100%", height: "100%" }} />
@@ -57,8 +60,10 @@ export default function RiveWaveform() {
 
       <style>{`
         @keyframes suzanne-wave {
-          0%, 100% { height: 4px; }
-          50%      { height: 24px; }
+          0%, 100% { height: 5px; }
+          25%      { height: 28px; }
+          50%      { height: 12px; }
+          75%      { height: 22px; }
         }
       `}</style>
     </div>

@@ -302,6 +302,12 @@ const MessageItem = memo(function MessageItem({
     useSuzanneStore.setState((s) => ({ tokenPulse: s.tokenPulse + 1 }));
   }, []);
 
+  // Fin du déchiffrage → on garde l'état "speaking" encore un moment
+  // pour que la waveform reste bien visible même sur les réponses courtes.
+  const handleSettle = useCallback(() => {
+    setTimeout(finishSpeaking, 1400);
+  }, [finishSpeaking]);
+
   return (
     <motion.div
       layout
@@ -320,7 +326,7 @@ const MessageItem = memo(function MessageItem({
             text={msg.text}
             speed={msg.isUser ? 120 : 110}
             onProgress={msg.isUser ? undefined : pulse}
-            onSettle={msg.isUser ? undefined : finishSpeaking}
+            onSettle={msg.isUser ? undefined : handleSettle}
           />
         ) : (
           msg.text
@@ -407,7 +413,12 @@ function CommandBar() {
   }, [idle]);
 
   return (
-    <div className="pointer-events-none absolute inset-x-0 bottom-10 z-20 flex justify-center px-8">
+    <div className="pointer-events-none absolute inset-x-0 bottom-10 z-20 flex flex-col items-center gap-3 px-8">
+      {/* Waveform centrée au-dessus de l'input — visible quand Suzanne parle */}
+      <div className="pointer-events-none">
+        <RiveWaveform />
+      </div>
+
       <motion.div
         initial={{ opacity: 0, y: 18 }}
         animate={{ opacity: 1, y: 0 }}
@@ -425,10 +436,6 @@ function CommandBar() {
           disabled={!idle}
           className="min-w-0 flex-1 border-none bg-transparent text-center text-xl text-neutral-900 outline-none placeholder:text-neutral-300 focus:ring-0 disabled:opacity-40"
         />
-        {/* onde Rive ultra-discrète, collée au texte, sans boîte */}
-        <div className="pointer-events-none shrink-0 opacity-80">
-          <RiveWaveform />
-        </div>
         <button
           onClick={send}
           disabled={!idle || !value.trim()}
