@@ -79,7 +79,7 @@ export default function GlobeScene() {
     };
   }, []);
 
-  /* --- config initiale --- */
+  /* --- config initiale + globe clair --- */
   useEffect(() => {
     const g = globeRef.current;
     if (!g) return;
@@ -90,6 +90,40 @@ export default function GlobeScene() {
       c.autoRotateSpeed = 0.6;
       c.enableZoom = false;
     }
+
+    // Rend le globe clair : on parcourt la scène three.js DÉJÀ créée
+    // par react-globe.gl et on éclaircit le material de la sphère.
+    // (aucune nouvelle instance three.js → pas de conflit WebGL)
+    const recolor = () => {
+      const scene = g.scene?.();
+      if (!scene) return;
+      scene.traverse((obj: unknown) => {
+        const mesh = obj as {
+          type?: string;
+          geometry?: { type?: string };
+          material?:
+            | {
+                color?: { set: (c: string) => void };
+                emissive?: { set: (c: string) => void };
+              }
+            | Array<{
+                color?: { set: (c: string) => void };
+              }>;
+        };
+        // la sphère du globe : SphereGeometry
+        if (
+          mesh.geometry?.type === "SphereGeometry" &&
+          mesh.material &&
+          !Array.isArray(mesh.material)
+        ) {
+          mesh.material.color?.set("#eef0f5");
+          mesh.material.emissive?.set("#e5e7f0");
+        }
+      });
+    };
+    // léger délai : laisse react-globe.gl construire la sphère
+    const t = setTimeout(recolor, 100);
+    return () => clearTimeout(t);
   }, [landPolygons]);
 
   /* --- vitesse selon l'état --- */
