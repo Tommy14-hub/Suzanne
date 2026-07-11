@@ -46,14 +46,16 @@ export default function RiveWaveform() {
       className="relative flex h-16 w-40 items-center justify-center"
       aria-hidden="true"
     >
-      {riveOk && !riveFailed && (
-        <div className="absolute inset-0">
-          <RiveComponent style={{ width: "100%", height: "100%" }} />
-        </div>
-      )}
+      {/* RiveComponent TOUJOURS monté — le canvas doit exister dès le
+          départ pour que Rive puisse s'y attacher correctement.
+          Le rendre conditionnel (sur riveOk) casse le rattachement. */}
+      <div className="absolute inset-0">
+        <RiveComponent style={{ width: "100%", height: "100%" }} />
+      </div>
 
+      {/* Repli CSS superposé tant que Rive n'a pas confirmé son chargement */}
       {showCss && (
-        <div className="flex h-full items-center justify-center gap-1">
+        <div className="absolute inset-0 flex items-center justify-center gap-1 bg-transparent">
           {Array.from({ length: 13 }).map((_, i) => (
             <span
               key={i}
