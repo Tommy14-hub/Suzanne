@@ -1,14 +1,14 @@
 "use client";
 
 /* ============================================================
-   GLOBE SCENE — react-globe.gl (three.js)
-   Continents pointillés, arcs IP animés, satellite orbital,
-   anneaux de propagation. Réactif au store (idle/thinking/speaking).
+   GLOBE SCENE — react-globe.gl (three.js interne)
+   IMPORTANT : ne PAS importer three.js séparément — react-globe.gl
+   embarque sa propre instance. Deux instances = crash WebGL
+   (matrixWorld.determinantAffine is not a function).
    ============================================================ */
 
 import { useEffect, useRef, useState, useMemo } from "react";
 import Globe, { type GlobeMethods } from "react-globe.gl";
-import * as THREE from "three";
 import { feature } from "topojson-client";
 import { useSuzanneStore } from "./store";
 import { CITIES, type City } from "./networkSim";
@@ -24,6 +24,13 @@ interface RingData {
   lat: number;
   lng: number;
   color: string;
+}
+interface PointData {
+  lat: number;
+  lng: number;
+  color: string;
+  radius: number;
+  altitude: number;
 }
 
 export default function GlobeScene() {
@@ -72,7 +79,7 @@ export default function GlobeScene() {
     };
   }, []);
 
-  /* --- config initiale (une fois le globe monté) --- */
+  /* --- config initiale --- */
   useEffect(() => {
     const g = globeRef.current;
     if (!g) return;
@@ -85,7 +92,7 @@ export default function GlobeScene() {
     }
   }, [landPolygons]);
 
-  /* --- vitesse de rotation selon l'état --- */
+  /* --- vitesse selon l'état --- */
   useEffect(() => {
     const g = globeRef.current;
     if (!g) return;
@@ -145,7 +152,7 @@ export default function GlobeScene() {
     return () => clearInterval(iv);
   }, [status, intent, arcColor]);
 
-  /* --- orbite du satellite --- */
+  /* --- orbite du satellite (mise à jour de longitude) --- */
   useEffect(() => {
     if (!satellite) return;
     let raf = 0;
@@ -163,24 +170,27 @@ export default function GlobeScene() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [satellite?.lat]);
 
-  const satelliteObject = useMemo(() => {
-    const group = new THREE.Group();
-    const body = new THREE.Mesh(
-      new THREE.SphereGeometry(1.6, 12, 12),
-      new THREE.MeshBasicMaterial({ color: 0x22c55e })
-    );
-    const ring = new THREE.Mesh(
-      new THREE.TorusGeometry(3.4, 0.28, 8, 32),
-      new THREE.MeshBasicMaterial({
-        color: 0x4ade80,
-        transparent: true,
-        opacity: 0.7,
-      })
-    );
-    ring.rotation.x = Math.PI / 2.4;
-    group.add(body, ring);
-    return group;
-  }, []);
+  /* --- points : villes + satellite (comme point surélevé lumineux),
+         PAS d'objet three.js custom pour éviter tout conflit --- */
+  const points: PointData[] = useMemo(() => {
+    const base: PointData[] = CITIES.map((c) => ({
+      lat: c.lat,
+      lng: c.lng,
+      color: "#6366f1",
+      radius: 0.3,
+      altitude: 0.01,
+    }));
+    if (satellite) {
+      base.push({
+        lat: satellite.lat,
+        lng: satellite.lng,
+        color: "#22c55e",
+        radius: 0.55,
+        altitude: satellite.alt, // surélevé = effet "en orbite"
+      });
+    }
+    return base;
+  }, [satellite]);
 
   return (
     <div ref={containerRef} className="h-full w-full">
@@ -214,17 +224,13 @@ export default function GlobeScene() {
         ringMaxRadius={4}
         ringPropagationSpeed={3}
         ringRepeatPeriod={700}
-        pointsData={CITIES}
-        pointLat={(d: object) => (d as City).lat}
-        pointLng={(d: object) => (d as City).lng}
-        pointColor={() => "#6366f1"}
-        pointAltitude={0.01}
-        pointRadius={0.3}
-        objectsData={satellite ? [satellite] : []}
-        objectLat={(d: object) => (d as { lat: number }).lat}
-        objectLng={(d: object) => (d as { lng: number }).lng}
-        objectAltitude={(d: object) => (d as { alt: number }).alt}
-        objectThreeObject={() => satelliteObject.clone()}
+        pointsData={points}
+        pointLat={(d: object) => (d as PointData).lat}
+        pointLng={(d: object) => (d as PointData).lng}
+        pointColor={(d: object) => (d as PointData).color}
+        pointAltitude={(d: object) => (d as PointData).altitude}
+        pointRadius={(d: object) => (d as PointData).radius}
+        pointsTransitionDuration={0}
       />
     </div>
   );
