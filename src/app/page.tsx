@@ -380,6 +380,32 @@ function CommandBar() {
     [send]
   );
 
+  /* --- focus au montage : on peut taper immédiatement --- */
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  /* --- capture globale : n'importe quelle frappe redirige le focus
+         vers l'input, sans avoir à cliquer dessus --- */
+  useEffect(() => {
+    const handler = (e: globalThis.KeyboardEvent) => {
+      const el = inputRef.current;
+      if (!el || document.activeElement === el) return;
+      // ignore les raccourcis et touches spéciales
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key.length === 1 || e.key === "Backspace") {
+        el.focus();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  /* --- re-focus quand Suzanne a fini (retour à idle) --- */
+  useEffect(() => {
+    if (idle) inputRef.current?.focus();
+  }, [idle]);
+
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-10 z-20 flex justify-center px-8">
       <motion.div
@@ -395,6 +421,7 @@ function CommandBar() {
           onKeyDown={onKeyDown}
           placeholder="Écrire à Suzanne…"
           aria-label="Écrire à Suzanne"
+          autoFocus
           disabled={!idle}
           className="min-w-0 flex-1 border-none bg-transparent text-center text-xl text-neutral-900 outline-none placeholder:text-neutral-300 focus:ring-0 disabled:opacity-40"
         />
